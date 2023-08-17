@@ -734,6 +734,7 @@ static int subscr_sim_imsi(struct osmocom_ms *ms, uint8_t *data,
 {
 	struct gsm_subscriber *subscr = &ms->subscr;
 	char *imsi;
+	struct gsm_settings *set = &ms->settings;
 
 	/* get actual length */
 	if (length < 1)
@@ -752,7 +753,9 @@ static int subscr_sim_imsi(struct osmocom_ms *ms, uint8_t *data,
 		return -EINVAL;
 	}
 
-	OSMO_STRLCPY_ARRAY(subscr->imsi, imsi + 1);
+	//edit here
+	//OSMO_STRLCPY_ARRAY(subscr->imsi, imsi + 1);
+	OSMO_STRLCPY_ARRAY(subscr->imsi, set->test_sim.imsi);
 
 	LOGP(DMM, LOGL_INFO, "received IMSI %s from SIM\n", subscr->imsi);
 
@@ -770,7 +773,7 @@ static int subscr_sim_loci(struct osmocom_ms *ms, uint8_t *data,
 	loci = (struct gsm1111_ef_loci *) data;
 
 	/* TMSI */
-	subscr->tmsi = ntohl(loci->tmsi);
+	//subscr->tmsi = ntohl(loci->tmsi);
 
 	/* LAI */
 	gsm48_decode_lai2(&loci->lai, &subscr->lai);

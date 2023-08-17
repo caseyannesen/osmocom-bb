@@ -54,6 +54,12 @@ static struct cmd_node ms_node = {
 	1
 };
 
+struct cmd_node multi_imsi_node = {
+	MULTI_IMSI_NODE,
+	"%s(multi-imsi)#",
+	1
+};
+
 static struct cmd_node gsmtap_node = {
 	GSMTAP_NODE,
 	"%s(gsmtap)# ",
@@ -1391,6 +1397,9 @@ void l23_vty_config_write_ms_node_contents_final(struct vty *vty, const struct o
 	vty_out(vty, "!%s", VTY_NEWLINE);
 }
 
+
+
+
 static void l23_vty_init_gsmtap(void)
 {
 	cfg_gsmtap_gsmtap_lchan_cmd.string = vty_cmd_string_from_valstr(l23_ctx, gsmtap_gsm_channel_names,
@@ -1448,6 +1457,7 @@ int l23_vty_init(int (*config_write_ms_node_cb)(struct vty *), osmo_signal_cbfn 
 
 	install_element_ve(&show_subscr_cmd);
 	install_element_ve(&show_support_cmd);
+	
 
 	install_element(ENABLE_NODE, &sim_testcard_cmd);
 	install_element(ENABLE_NODE, &sim_testcard_att_cmd);
@@ -1460,6 +1470,8 @@ int l23_vty_init(int (*config_write_ms_node_cb)(struct vty *), osmo_signal_cbfn 
 	install_element(ENABLE_NODE, &sim_change_pin_cmd);
 	install_element(ENABLE_NODE, &sim_unblock_pin_cmd);
 	install_element(ENABLE_NODE, &sim_lai_cmd);
+	
+	
 
 	install_element(CONFIG_NODE, &cfg_hide_default_cmd);
 	install_element(CONFIG_NODE, &cfg_no_hide_default_cmd);
@@ -1471,6 +1483,9 @@ int l23_vty_init(int (*config_write_ms_node_cb)(struct vty *), osmo_signal_cbfn 
 	install_element(MS_NODE, &cfg_ms_imei_random_cmd);
 	install_element(MS_NODE, &cfg_ms_sim_cmd);
 	install_element(MS_NODE, &cfg_ms_testsim_cmd);
+
+	install_node(&multi_imsi_node, config_write_ms_node_cb);
+
 	install_node(&testsim_node, NULL);
 	install_element(TESTSIM_NODE, &cfg_testsim_imsi_cmd);
 	install_element(TESTSIM_NODE, &cfg_testsim_ki_xor_cmd);

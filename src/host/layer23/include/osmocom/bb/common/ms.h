@@ -19,6 +19,7 @@
 #include <osmocom/bb/mobile/mncc_sock.h>
 #include <osmocom/bb/common/sim.h>
 #include <osmocom/bb/common/l1ctl.h>
+#include <sqlite3.h>
 
 struct osmobb_ms_gmm_layer {
 	uint8_t ac_ref_nr;
@@ -107,6 +108,7 @@ struct osmocom_ms {
 	void *lua_state;
 	int lua_cb_ref;
 	char *lua_script;
+	sqlite3 *db_sms;
 };
 
 struct osmocom_ms *osmocom_ms_alloc(void *ctx, const char *name);

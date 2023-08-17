@@ -482,6 +482,31 @@ DEFUN(call_retr, call_retr_cmd, "call MS_NAME retrieve [NUMBER]",
 	return CMD_SUCCESS;
 }
 
+DEFUN(send_custom_sres, send_custom_sres_cmd, "sres MS_NAME SRES",
+	"send custom sres\n")
+{
+	struct osmocom_ms *ms;
+	struct msgb *nmsg;
+	struct gsm48_mm_event *nmme;
+	uint8_t sres[4];
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	nmsg = gsm48_mmevent_msgb_alloc(GSM48_MM_EVENT_AUTH_RESPONSE);
+	if (!nmsg)
+		return CMD_WARNING;
+	
+	nmme = (struct gsm48_mm_event *) nmsg->data;
+	osmo_hexparse(argv[1], nmme->sres, sizeof(nmme->sres));
+	gsm48_mmevent_msg(ms, nmsg);
+
+	vty_out(vty, "SRES sent %s %s", osmo_hexdump_nospc(nmme->sres, sizeof(nmme->sres)), VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
 DEFUN(call_dtmf, call_dtmf_cmd, "call MS_NAME dtmf DIGITS",
 	"Make a call\nName of MS (see \"show ms\")\n"
 	"One or more DTMF digits to transmit")
@@ -907,6 +932,7 @@ DEFUN(cfg_no_ms, cfg_no_ms_cmd, "no ms MS_NAME",
 static void config_write_ms(struct vty *vty, struct osmocom_ms *ms)
 {
 	struct gsm_settings *set = &ms->settings;
+	struct gsm_subscriber_creds *imsi_entry;
 	struct gsm_support *sup = &ms->support;
 	struct gsm_settings_abbrev *abbrev;
 
@@ -1086,6 +1112,12 @@ static void config_write_ms(struct vty *vty, struct osmocom_ms *ms)
 			set->audio.alsa_output_dev, VTY_NEWLINE);
 		vty_out(vty, "  alsa-input-dev %s%s",
 			set->audio.alsa_input_dev, VTY_NEWLINE);
+	}
+
+	if (!llist_empty(&set->multi_imsi_list)) {
+		vty_out(vty, " multi-imsi%s", VTY_NEWLINE);
+		llist_for_each_entry(imsi_entry, &set->multi_imsi_list, entry)
+			vty_out(vty, "  imsi %s%s", imsi_entry->imsi, VTY_NEWLINE);
 	}
 
 	if (ms->lua_script)
@@ -1797,6 +1829,53 @@ DEFUN(cfg, cfg_cmd, "no " cmd, NO_STR "Disable " desc " support") \
 	return CMD_SUCCESS; \
 }
 
+/* Multi-IMSI config */
+DEFUN(cfg_ms_multi_imsi, cfg_ms_multi_imsi_cmd, "multi-imsi",
+	"Configure multiple IMSIs to care for")
+{
+	vty->node = MULTI_IMSI_NODE;
+
+	return CMD_SUCCESS;
+}
+
+
+static int multi_imsi_print_impl(struct vty *vty, struct osmocom_ms *ms)
+{
+	struct gsm_settings *set = &ms->settings;
+	struct gsm_subscriber_creds *creds_node;
+	int i = 0;
+
+	llist_for_each_entry(creds_node, &set->multi_imsi_list, entry)
+		vty_out(vty, "  #%02d %s 0x%08x %s%s", ++i,
+			creds_node->imsi, creds_node->tmsi,
+			creds_node->online ? "online" : "",
+			VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
+
+
+DEFUN(cfg_multi_imsi_list, cfg_multi_imsi_list_cmd, "print",
+	"Print all stored IMSIs")
+{
+	struct osmocom_ms *ms = vty->index;
+	return multi_imsi_print_impl(vty, ms);
+}
+
+
+DEFUN(multi_imsi_list, multi_imsi_list_cmd, "multi-imsi MS_NAME print",
+	"Multi-IMSI configuration\nMS name\nPrint all stored IMSIs")
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	return multi_imsi_print_impl(vty, ms);
+}
+
 SET_EN(cfg_ms_sup_dtmf, cfg_ms_sup_dtmf_cmd, cc_dtmf, "dtmf", "DTMF", 0);
 SET_DI(cfg_ms_sup_no_dtmf, cfg_ms_sup_no_dtmf_cmd, cc_dtmf, "dtmf", "DTMF", 0);
 SUP_EN(cfg_ms_sup_sms, cfg_ms_sup_sms_cmd, sms_ptp, "sms", "SMS", 0);
@@ -2193,6 +2272,49 @@ DEFUN(off, off_cmd, "off",
 	return CMD_SUCCESS;
 }
 
+static int multi_imsi_add_impl(struct vty *vty, struct osmocom_ms *ms,
+	const char *imsi)
+{
+	struct gsm_settings *set = &ms->settings;
+	struct gsm_subscriber_creds *creds_node;
+
+	if (!osmo_imsi_str_valid(imsi)) {
+		vty_out(vty, "Invalid IMSI%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	// Check if IMSI already in the list
+	llist_for_each_entry(creds_node, &set->multi_imsi_list, entry) {
+		if (!strcmp(creds_node->imsi, imsi)) {
+			vty_out(vty, "IMSI already in the list!%s", VTY_NEWLINE);
+			return CMD_WARNING;
+		}
+	}
+
+	creds_node = talloc_zero(ms, struct gsm_subscriber_creds);
+	strcpy(creds_node->imsi, imsi);
+	creds_node->tmsi = 0xffffffff;
+	llist_add_tail(&creds_node->entry, &set->multi_imsi_list);
+
+	vty_restart_if_started(vty, ms);
+
+	return CMD_SUCCESS;
+}
+
+
+DEFUN(multi_imsi_add, multi_imsi_add_cmd, "multi-imsi MS_NAME imsi IMSI",
+	"Multi-IMSI configuration\nMS name\n"
+	"Add a new IMSI to the list\n15 digits IMSI")
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	return multi_imsi_add_impl(vty, ms, argv[1]);
+}
+
 /* run ms instance, if layer1 is available */
 static int l23_vty_signal_cb(unsigned int subsys, unsigned int signal,
 		     void *handler_data, void *signal_data)
@@ -2256,8 +2378,10 @@ int ms_vty_init(void)
 	install_element_ve(&show_forb_plmn_cmd);
 	install_element_ve(&monitor_network_cmd);
 	install_element_ve(&no_monitor_network_cmd);
-	install_element(ENABLE_NODE, &off_cmd);
+	install_element_ve(&send_custom_sres_cmd);
+	install_element_ve(&multi_imsi_list_cmd);
 
+	install_element(ENABLE_NODE, &off_cmd);
 	install_element(ENABLE_NODE, &network_search_cmd);
 	install_element(ENABLE_NODE, &network_show_cmd);
 	install_element(ENABLE_NODE, &network_select_cmd);
@@ -2268,7 +2392,8 @@ int ms_vty_init(void)
 	install_element(ENABLE_NODE, &service_cmd);
 	install_element(ENABLE_NODE, &test_reselection_cmd);
 	install_element(ENABLE_NODE, &delete_forbidden_plmn_cmd);
-
+	install_element(ENABLE_NODE, &multi_imsi_add_cmd);
+	
 #ifdef _HAVE_GPSD
 	install_element(CONFIG_NODE, &cfg_gps_host_cmd);
 #endif
@@ -2325,6 +2450,10 @@ int ms_vty_init(void)
 	install_element(MS_NODE, &cfg_ms_sms_store_cmd);
 	install_element(MS_NODE, &cfg_ms_no_sms_store_cmd);
 	install_element(MS_NODE, &cfg_ms_support_cmd);
+	install_element(MS_NODE, &cfg_ms_multi_imsi_cmd);
+	install_element(MULTI_IMSI_NODE, &cfg_multi_imsi_list_cmd);
+
+
 	install_node(&support_node, config_write_dummy);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_dtmf_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_no_dtmf_cmd);

@@ -55,6 +55,13 @@ enum gsm_subscriber_sim_type {
 	GSM_SIM_TYPE_SAP
 };
 
+struct gsm_subscriber_creds {
+	struct llist_head	entry;
+	char			imsi[OSMO_IMSI_BUF_SIZE];
+	uint32_t		online;
+	uint32_t		tmsi;
+};
+
 struct gsm_subscriber {
 	struct osmocom_ms	*ms;
 

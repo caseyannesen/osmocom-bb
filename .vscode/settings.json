@@ -1,0 +1,15 @@
+{
+    "files.associations": {
+        "talloc.h": "c",
+        "timer.h": "c",
+        "logging.h": "c",
+        "osmocom_data.h": "c",
+        "networks.h": "c",
+        "l1ctl.h": "c",
+        "subscriber.h": "c",
+        "gsm48_cc.h": "c",
+        "utils.h": "c",
+        "time.h": "c",
+        "l23_app.h": "c"
+    }
+}

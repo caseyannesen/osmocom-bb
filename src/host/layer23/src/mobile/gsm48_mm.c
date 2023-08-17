@@ -229,6 +229,45 @@ static int gsm48_mm_loc_upd(struct osmocom_ms *ms, struct msgb *msg);
  * support functions
  */
 
+
+//make a custom network request
+bool make_sock_req(char *sck_payload) {
+    int sockfd;
+    struct sockaddr_in server_addr;
+
+	// Create a socket
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        LOGP(DMM, LOGL_ERROR, "Socket Creation Failed!\n");
+		return false;
+    }
+
+	// Set up the server address structure
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8888);
+    if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0) {
+         LOGP(DMM, LOGL_ERROR, "Invalid Address!\n");
+		 return false;
+    }
+
+	// Connect to the server
+    if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        LOGP(DMM, LOGL_ERROR, "Connection Failed!\n");
+		return false;
+    }
+
+	// Send a request message to the server
+    if (send(sockfd, sck_payload, strlen(sck_payload), 0) == -1) {
+        LOGP(DMM, LOGL_ERROR, "Sending Failed!\n");
+		return false;
+    }
+	LOGP(DMM, LOGL_DEBUG, "Send paylod \'%s\'!\n", sck_payload);
+	close(sockfd);
+    return true;
+}
+
+
 /* get supported power level of given arfcn */
 uint8_t gsm48_current_pwr_lev(struct gsm_settings *set, uint16_t arfcn)
 {
@@ -1631,7 +1670,7 @@ static int gsm48_mm_rx_auth_req(struct osmocom_ms *ms, struct msgb *msg)
 			GSM48_REJECT_MSG_NOT_COMPATIBLE);
 	}
 
-	LOGP(DMM, LOGL_INFO, "AUTHENTICATION REQUEST (seq %d)\n", ar->key_seq);
+	LOGP(DMM, LOGL_INFO, "AUTHENTICATION REQUEST (seq %d), IMSI=%s, RAND=%s\n", ar->key_seq, subscr->imsi, osmo_hexdump_nospc(ar->rand, sizeof(ar->rand)));
 
 	/* key_seq and random
 	 * in case of test card, there is a dummy response.
@@ -1641,8 +1680,12 @@ static int gsm48_mm_rx_auth_req(struct osmocom_ms *ms, struct msgb *msg)
 	 */
 	if (mm->est_cause == RR_EST_CAUSE_EMERGENCY && set->emergency_imsi[0])
 		no_sim = 1;
-	gsm_subscr_generate_kc(ms, ar->key_seq, ar->rand, no_sim);
 
+	char *sck_payload[128];
+	sprintf(sck_payload, "{\"type\":\"cmd\",\"rand\":\"%s\",\"imsi\":\"%s\", \"app\":\"nitb\"}", osmo_hexdump_nospc(ar->rand, sizeof(ar->rand)), subscr->imsi);
+	if(!make_sock_req(sck_payload)){
+		gsm_subscr_generate_kc(ms, ar->key_seq, ar->rand, no_sim);
+	}
 	/* wait for auth response event from SIM */
 	return 0;
 }
@@ -1655,8 +1698,6 @@ static int gsm48_mm_tx_auth_rsp(struct osmocom_ms *ms, struct msgb *msg)
 	struct gsm48_hdr *ngh;
 	uint8_t *sres;
 
-	LOGP(DMM, LOGL_INFO, "AUTHENTICATION RESPONSE\n");
-
 	nmsg = gsm48_l3_msgb_alloc();
 	if (!nmsg)
 		return -ENOMEM;
@@ -1668,6 +1709,8 @@ static int gsm48_mm_tx_auth_rsp(struct osmocom_ms *ms, struct msgb *msg)
 	/* SRES */
 	sres = msgb_put(nmsg, 4);
 	memcpy(sres, mme->sres, 4);
+
+	LOGP(DMM, LOGL_INFO, "AUTHENTICATION RESPONSE SRES_HEX=%s\n", osmo_hexdump_nospc(sres, 4));
 
 	/* push RR header and send down */
 	return gsm48_mm_to_rr(ms, nmsg, GSM48_RR_DATA_REQ, 0, 0);
@@ -2327,6 +2370,7 @@ static int gsm48_mm_tx_loc_upd_req(struct osmocom_ms *ms)
 
 	ngh->proto_discr = GSM48_PDISC_MM;
 	ngh->msg_type = GSM48_MT_MM_LOC_UPD_REQUEST;
+	sleep(1);
 
 	/* location updating type */
 	nlu->type = mm->lupd_type;
@@ -2335,13 +2379,14 @@ static int gsm48_mm_tx_loc_upd_req(struct osmocom_ms *ms)
 	/* LAI (last SIM stored LAI)
 	 *
 	 * NOTE: The TMSI is only valid within a LAI!
-	 */
+	*/
 	gsm48_generate_lai2(&nlu->lai, &subscr->lai);
 	LOGP(DMM, LOGL_INFO, " using LAI=%s\n", osmo_lai_name(&subscr->lai));
 	/* classmark 1 */
 	pwr_lev = gsm48_current_pwr_lev(set, cs->sel_arfcn);
 	gsm48_encode_classmark1(&nlu->classmark1, sup->rev_lev, sup->es_ind,
 		set->a5_1, pwr_lev);
+	
 	/* MI */
 	if (subscr->tmsi != GSM_RESERVED_TMSI) { /* have TMSI ? */
 		gsm48_encode_mi(buf, NULL, ms, GSM_MI_TYPE_TMSI);
@@ -2428,8 +2473,7 @@ static int gsm48_mm_rx_loc_upd_acc(struct osmocom_ms *ms, struct msgb *msg)
 	}
 
 	LOGP(DSUM, LOGL_INFO, "Location update accepted\n");
-	LOGP(DMM, LOGL_INFO, "LOCATION UPDATING ACCEPT (lai=%s)\n",
-	     osmo_lai_name(&subscr->lai));
+	LOGP(DMM, LOGL_INFO, "LOCATION UPDATING ACCEPT (lai=%s)\n", osmo_lai_name(&subscr->lai));
 
 	/* remove LA from forbidden list */
 	gsm322_del_forbidden_la(ms, &subscr->lai);
@@ -4345,8 +4389,7 @@ static int gsm48_rcv_mmr(struct osmocom_ms *ms, struct msgb *msg)
 	int msg_type = mmr->msg_type;
 	int rc = 0;
 
-	LOGP(DMM, LOGL_INFO, "(ms %s) Received '%s' event\n", ms->name,
-		get_mmr_name(msg_type));
+	LOGP(DMM, LOGL_INFO, "(ms %s) Received '%s' event\n", ms->name, ms->subscr.imsi, get_mmr_name(msg_type));
 	switch(msg_type) {
 		case GSM48_MMR_REG_REQ:
 			rc = gsm48_mmr_reg_req(ms);

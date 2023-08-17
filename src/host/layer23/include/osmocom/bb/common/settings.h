@@ -109,7 +109,9 @@ struct gsm_settings {
 	/* SMS */
 	char			sms_sca[22];
 	bool			store_sms;
-
+    
+	/*Multi imsi settings */
+	struct llist_head	multi_imsi_list;
 	/* test card simulator settings */
 	struct test_sim_settings test_sim;
 

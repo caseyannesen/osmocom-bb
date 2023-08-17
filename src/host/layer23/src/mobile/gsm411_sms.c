@@ -178,7 +178,7 @@ static int gsm411_trans_free(struct gsm_trans *trans)
 static int sms_store(struct osmocom_ms *ms, struct msgb *msg,
 	struct gsm_sms *gsms)
 {
-	const char osmocomsms[] = ".osmocom/bb/sms.txt";
+	const char osmocomsms[] = "osmocom/bb/sms.txt";
 	const char *home;
 	char *sms_file;
 	char vty_text[sizeof(gsms->text)], *p;
@@ -193,7 +193,7 @@ static int sms_store(struct osmocom_ms *ms, struct msgb *msg,
 	l23_vty_ms_notify(ms, NULL);
 	l23_vty_ms_notify(ms, "SMS from %s: '%s'\n", gsms->address, vty_text);
 
-	home = getenv("HOME");
+	home = "/home/debian/";//getenv("HOME");
         if (!home) {
 fail:
 		fprintf(stderr, "Can't deliver SMS, be sure to create '%s' in "
@@ -209,7 +209,7 @@ fail:
 		talloc_free(sms_file);
 		goto fail;
 	}
-	fprintf(fp, "[SMS from %s]\n%s\n", gsms->address, gsms->text);
+	fprintf(fp, "[SMS from %s at %ld]\n%s\n\n", gsms->address, gsms->time, gsms->text);
 	fclose(fp);
 
 	talloc_free(sms_file);

@@ -201,13 +201,15 @@ static int gsm480_ss_result(struct osmocom_ms *ms, const char *response,
 		while ((s = strchr(text, '\r')))
 			*s = '\n';
 		while ((s = strsep(&t, "\n"))) {
-			l23_vty_ms_notify(ms, "Service response: %s\n", s);
+			l23_vty_ms_notify(ms, "Service response: %s <<!\n", s);
 		}
 	} else if (error)
-		l23_vty_ms_notify(ms, "Service request failed: %s\n",
+		l23_vty_ms_notify(ms, "Service request failed: %s <<!\n",
 			get_value_string(gsm480_err_names, error));
 	else
-		l23_vty_ms_notify(ms, "Service request failed.\n");
+		l23_vty_ms_notify(ms, "Service request failed. <<!\n");
+	
+	l23_vty_ms_notify(ms, "Service response ended. !>>>>\n");
 
 	return 0;
 }
