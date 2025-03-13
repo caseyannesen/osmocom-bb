@@ -1804,6 +1804,7 @@ static int gsm48_mm_tx_id_rsp(struct osmocom_ms *ms, uint8_t mi_type)
 	struct gsm48_hdr *ngh;
 	uint8_t buf[11];
 
+	usleep(500000);
 	LOGP(DMM, LOGL_INFO, "IDENTITY RESPONSE\n");
 
 	nmsg = gsm48_l3_msgb_alloc();
@@ -2370,7 +2371,7 @@ static int gsm48_mm_tx_loc_upd_req(struct osmocom_ms *ms)
 
 	ngh->proto_discr = GSM48_PDISC_MM;
 	ngh->msg_type = GSM48_MT_MM_LOC_UPD_REQUEST;
-	sleep(1);
+	
 
 	/* location updating type */
 	nlu->type = mm->lupd_type;

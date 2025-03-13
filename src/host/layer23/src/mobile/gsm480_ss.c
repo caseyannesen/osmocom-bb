@@ -190,6 +190,16 @@ static const struct value_string Bearerservice_vals[] = {
 	{ 0, NULL }
 };
 
+/* Modified to append TLV instead of prepend */
+static inline unsigned char *msgb_append_TLV1(struct msgb *msgb, uint8_t tag, uint8_t value)
+{
+    uint8_t *data = msgb_put(msgb, 3); // Append 3 bytes to the tail
+    data[0] = tag;
+    data[1] = 1;       // Length = 1 byte
+    data[2] = value;   // Value
+    return data;
+}
+
 static int gsm480_ss_result(struct osmocom_ms *ms, const char *response,
 	uint8_t error)
 {
@@ -443,6 +453,10 @@ static int gsm480_tx_invoke(struct gsm_trans *trans, struct msgb *msg,
 		msgb_wrap_with_L(msg);
 	else
 		msgb_push_tl(msg, GSM0480_IE_FACILITY);
+
+	if (trans->ss.state == GSM480_SS_ST_REGISTER)
+		msgb_append_TLV1(msg, GSM0480_IE_SS_VERSION, 0x00);
+
 
 	/* FIXME: If phase 2, we need SSVERSION to be added */
 

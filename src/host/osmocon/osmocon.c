@@ -611,7 +611,7 @@ static int handle_write_block(void)
 	return 0;
 }
 
-#define WRITE_BLOCK	4096
+#define WRITE_BLOCK	2048
 
 static int handle_write_dnload(void)
 {

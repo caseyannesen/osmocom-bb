@@ -144,7 +144,7 @@ struct gsm48_mm_event {
 } __attribute__((packed));
 
 /* GSM 04.08 MM timers */
-#define GSM_T3210_MS    20, 0
+#define GSM_T3210_MS    30, 0
 #define GSM_T3211_MS    15, 0
 /* T3212 is given by SYSTEM INFORMATION */
 #define GSM_T3213_MS    4, 0
