@@ -2026,6 +2026,83 @@ DEFUN(cfg_ms_sup_class_pcs, cfg_ms_sup_class_pcs_cmd, "class-pcs (1|2|3)",
 	return CMD_SUCCESS;
 }
 
+DEFUN(clone_tsmi, clone_tsmi_cmd, "clone tmsi MS_NAME [TMSI]",
+	"Spoof mobile identity\n"
+	"Force MS to use specified TMSI\n"
+	"Name of MS (see \"show ms\")\n"
+	"Specify required TMSI (e.g. 0xdeadbeef)")
+{
+	uint32_t tmsi = 0xffffffff;
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	if (argc >= 2)
+		tmsi = strtoul(argv[1], NULL, 16);
+
+	ms->subscr.tmsi = tmsi;
+	vty_out(vty, "Forced to use the following TMSI: 0x%08X%s",
+		tmsi, VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
+
+DEFUN(clone_imsi, clone_imsi_cmd, "clone imsi MS_NAME IMSI",
+	"Spoof mobile identity\n"
+	"Force MS to use specified IMSI\n"
+	"Name of MS (see \"show ms\")\n"
+	"Specify required IMSI (15 digits)")
+{
+	const char *imsi = argv[1];
+	struct osmocom_ms *ms;
+	char *error;
+
+	
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+
+	if (!osmo_imsi_str_valid(imsi)) {
+		vty_out(vty, "Invalid IMSI%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	osmo_strlcpy(ms->subscr.imsi, imsi, sizeof(ms->subscr.imsi));
+	vty_out(vty, "Forced to use the following IMSI: %s%s",
+			ms->subscr.imsi, VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
+
+DEFUN(clone_kc_num, clone_kc_num_cmd, "clone kc_num MS_NAME NUM",
+	"Spoof mobile identity\n"
+	"Change current Key Sequence number\n"
+	"Name of MS (see \"show ms\")\n"
+	"Key Sequence number")
+{
+	uint8_t kc_num = 0;
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	if (argc >= 2)
+		osmo_hexparse(argv[1], &ms->subscr.key, 8);
+		ms->subscr.key_seq = kc_num;
+
+	// convert the kc
+	vty_out(vty, "Forced to use the following "
+		"Key Sequence number: %u %s %s", kc_num, osmo_hexdump(ms->subscr.key, 8),VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
 DEFUN(cfg_ms_sup_ch_cap, cfg_ms_sup_ch_cap_cmd,
 	"channel-capability (sdcch|sdcch+tchf|sdcch+tchf+tchh)",
 	"Select channel capability\n"
@@ -2393,6 +2470,9 @@ int ms_vty_init(void)
 	install_element(ENABLE_NODE, &test_reselection_cmd);
 	install_element(ENABLE_NODE, &delete_forbidden_plmn_cmd);
 	install_element(ENABLE_NODE, &multi_imsi_add_cmd);
+	install_element(ENABLE_NODE, &clone_tsmi_cmd);
+	install_element(ENABLE_NODE, &clone_imsi_cmd);
+	install_element(ENABLE_NODE, &clone_kc_num_cmd);
 	
 #ifdef _HAVE_GPSD
 	install_element(CONFIG_NODE, &cfg_gps_host_cmd);

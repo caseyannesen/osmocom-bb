@@ -440,6 +440,7 @@ int gsm_subscr_dump_forbidden_plmn(struct osmocom_ms *ms,
 {
 	struct gsm_subscriber *subscr = &ms->subscr;
 	struct gsm_sub_plmn_na *temp;
+	
 
 	print(priv, "MCC    |MNC    |cause\n");
 	print(priv, "-------+-------+-------\n");
@@ -459,6 +460,8 @@ void gsm_subscr_dump(struct gsm_subscriber *subscr,
 	int i;
 	struct gsm_sub_plmn_list *plmn_list;
 	struct gsm_sub_plmn_na *plmn_na;
+	//pointer for hextring
+	char *hexstringkc;
 
 	print(priv, "Mobile Subscriber of MS '%s':\n", subscr->ms->name);
 
@@ -482,6 +485,15 @@ void gsm_subscr_dump(struct gsm_subscriber *subscr,
 		(subscr->imsi_attached) ? "attached" : "detached");
 	if (subscr->tmsi != GSM_RESERVED_TMSI)
 		print(priv, "  TMSI 0x%08x", subscr->tmsi);
+	if (subscr->key_seq != 7) {
+		print(priv, " Key: sequence %d ", subscr->key_seq);
+		hexstringkc = osmo_hexdump_nospc(subscr->key, sizeof(subscr->key));
+		//print the hexstringkc
+		print(priv, " %s", hexstringkc);
+		print(priv, "\n");
+	}
+
+	
 	if (subscr->lai.lac > 0x0000 && subscr->lai.lac < 0xfffe) {
 		print(priv, "\n");
 		print(priv, "         LAI: %s  (%s, %s)\n",
@@ -515,12 +527,13 @@ void gsm_subscr_dump(struct gsm_subscriber *subscr,
 
 	if (subscr->gprs.ptmsi != GSM_RESERVED_TMSI)
 		print(priv, "  P-TMSI 0x%08x", subscr->gprs.ptmsi);
-	if (subscr->key_seq != 7) {
-		print(priv, " Key: sequence %d ", subscr->key_seq);
-		for (i = 0; i < sizeof(subscr->key); i++)
-			print(priv, " %02x", subscr->key[i]);
-		print(priv, "\n");
-	}
+		if (subscr->key_seq != 7) {
+			print(priv, " Key: sequence %d ", subscr->key_seq);
+			hexstringkc = osmo_hexdump_nospc(subscr->key, sizeof(subscr->key));
+			//print the hexstringkc
+			print(priv, " %s", hexstringkc);
+			print(priv, "\n");
+		}
 	if (subscr->plmn_valid)
 		print(priv, " Registered PLMN: MCC-MNC %s  (%s, %s)\n",
 			osmo_plmn_name(&subscr->plmn),
