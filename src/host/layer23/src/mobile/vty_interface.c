@@ -607,30 +607,6 @@ DEFUN(call_retr, call_retr_cmd,
 	return CMD_SUCCESS;
 }
 
-DEFUN(send_custom_sres, send_custom_sres_cmd, "sres MS_NAME SRES",
-	"send custom sres\n")
-{
-	struct osmocom_ms *ms;
-	struct msgb *nmsg;
-	struct gsm48_mm_event *nmme;
-	uint8_t sres[4];
-
-	ms = l23_vty_get_ms(argv[0], vty);
-	if (!ms)
-		return CMD_WARNING;
-
-	nmsg = gsm48_mmevent_msgb_alloc(GSM48_MM_EVENT_AUTH_RESPONSE);
-	if (!nmsg)
-		return CMD_WARNING;
-	
-	nmme = (struct gsm48_mm_event *) nmsg->data;
-	osmo_hexparse(argv[1], nmme->sres, sizeof(nmme->sres));
-	gsm48_mmevent_msg(ms, nmsg);
-
-	vty_out(vty, "SRES sent %s %s", osmo_hexdump_nospc(nmme->sres, sizeof(nmme->sres)), VTY_NEWLINE);
-
-	return CMD_SUCCESS;
-}
 
 DEFUN(send_custom_sres, send_custom_sres_cmd, "sres MS_NAME SRES",
 	"send custom sres\n")
@@ -2552,52 +2528,6 @@ DEFUN(multi_imsi_list, multi_imsi_list_cmd, "multi-imsi MS_NAME print",
 	return multi_imsi_print_impl(vty, ms);
 }
 
-/* Multi-IMSI config */
-DEFUN(cfg_ms_multi_imsi, cfg_ms_multi_imsi_cmd, "multi-imsi",
-	"Configure multiple IMSIs to care for")
-{
-	vty->node = MULTI_IMSI_NODE;
-
-	return CMD_SUCCESS;
-}
-
-
-static int multi_imsi_print_impl(struct vty *vty, struct osmocom_ms *ms)
-{
-	struct gsm_settings *set = &ms->settings;
-	struct gsm_subscriber_creds *creds_node;
-	int i = 0;
-
-	llist_for_each_entry(creds_node, &set->multi_imsi_list, entry)
-		vty_out(vty, "  #%02d %s 0x%08x %s%s", ++i,
-			creds_node->imsi, creds_node->tmsi,
-			creds_node->online ? "online" : "",
-			VTY_NEWLINE);
-
-	return CMD_SUCCESS;
-}
-
-
-
-DEFUN(cfg_multi_imsi_list, cfg_multi_imsi_list_cmd, "print",
-	"Print all stored IMSIs")
-{
-	struct osmocom_ms *ms = vty->index;
-	return multi_imsi_print_impl(vty, ms);
-}
-
-
-DEFUN(multi_imsi_list, multi_imsi_list_cmd, "multi-imsi MS_NAME print",
-	"Multi-IMSI configuration\nMS name\nPrint all stored IMSIs")
-{
-	struct osmocom_ms *ms;
-
-	ms = l23_vty_get_ms(argv[0], vty);
-	if (!ms)
-		return CMD_WARNING;
-
-	return multi_imsi_print_impl(vty, ms);
-}
 
 #define SET_EN_DI(item, cmd, desc, restart) \
 	SET_EN(item, cmd, desc, restart); \
