@@ -26,6 +26,7 @@
 #include <osmocom/core/logging.h>
 #include <osmocom/core/bits.h>
 
+#include <osmocom/gsm/gsm0502.h>
 #include <osmocom/gsm/gsm_utils.h>
 #include <osmocom/gsm/protocol/gsm_04_08.h>
 #include <osmocom/coding/gsm0503_coding.h>
@@ -36,10 +37,11 @@
 int rx_pdtch_fn(struct l1sched_lchan_state *lchan,
 		const struct l1sched_burst_ind *bi)
 {
-	uint8_t l2[GPRS_L2_MAX_LEN], *mask;
+	uint8_t l2[GPRS_L2_MAX_LEN];
 	int n_errors, n_bits_total, rc;
 	sbit_t *bursts_p, *burst;
 	size_t l2_len;
+	uint32_t *mask;
 
 	/* Set up pointers */
 	mask = &lchan->rx_burst_mask;
@@ -103,20 +105,25 @@ int rx_pdtch_fn(struct l1sched_lchan_state *lchan,
 
 static struct msgb *prim_dequeue_pdtch(struct l1sched_lchan_state *lchan, uint32_t fn)
 {
-	const struct l1sched_prim *prim;
-	struct msgb *msg;
+	while (!llist_empty(&lchan->tx_prims)) {
+		struct msgb *msg = llist_first_entry(&lchan->tx_prims, struct msgb, list);
+		const struct l1sched_prim *prim = l1sched_prim_from_msgb(msg);
+		int ret = gsm0502_fncmp(prim->data_req.frame_nr, fn);
 
-	msg = msgb_dequeue(&lchan->tx_prims);
-	if (msg == NULL)
-		return NULL;
-	prim = l1sched_prim_from_msgb(msg);
+		if (OSMO_LIKELY(ret == 0)) { /* it's a match! */
+			llist_del(&msg->list);
+			return msg;
+		} else if (ret > 0) { /* not now, come back later */
+			break;
+		} /* else: the ship has sailed, drop your ticket */
 
-	if (OSMO_LIKELY(prim->data_req.frame_nr == fn))
-		return msg;
-	LOGP_LCHAND(lchan, LOGL_ERROR,
-		    "%s(): dropping Tx primitive (current Fn=%u, prim Fn=%u)\n",
-		    __func__, fn, prim->data_req.frame_nr);
-	msgb_free(msg);
+		LOGP_LCHAND(lchan, LOGL_ERROR,
+			    "%s(): dropping stale Tx prim (current Fn=%u, prim Fn=%u): %s\n",
+			    __func__, fn, prim->data_req.frame_nr, msgb_hexdump_l2(msg));
+		llist_del(&msg->list);
+		msgb_free(msg);
+	}
+
 	return NULL;
 }
 
@@ -125,7 +132,7 @@ int tx_pdtch_fn(struct l1sched_lchan_state *lchan,
 {
 	ubit_t *bursts_p, *burst;
 	const uint8_t *tsc;
-	uint8_t *mask;
+	uint32_t *mask;
 	int rc;
 
 	/* Set up pointers */
@@ -140,18 +147,22 @@ int tx_pdtch_fn(struct l1sched_lchan_state *lchan,
 
 	*mask = *mask << 4;
 
-	lchan->prim = prim_dequeue_pdtch(lchan, br->fn);
-	if (lchan->prim == NULL)
+	struct msgb *msg = prim_dequeue_pdtch(lchan, br->fn);
+	if (msg == NULL)
 		return -ENOENT;
 
 	/* Encode payload */
-	rc = gsm0503_pdtch_encode(bursts_p, msgb_l2(lchan->prim), msgb_l2len(lchan->prim));
+	rc = gsm0503_pdtch_encode(bursts_p, msgb_l2(msg), msgb_l2len(msg));
 	if (rc < 0) {
 		LOGP_LCHAND(lchan, LOGL_ERROR, "Failed to encode L2 payload (len=%u): %s\n",
-			    msgb_l2len(lchan->prim), msgb_hexdump_l2(lchan->prim));
-		l1sched_lchan_prim_drop(lchan);
+			    msgb_l2len(msg), msgb_hexdump_l2(msg));
+		msgb_free(msg);
 		return -EINVAL;
 	}
+
+	/* Cache the prim, so that we can confirm it later (see below) */
+	OSMO_ASSERT(lchan->prim == NULL);
+	lchan->prim = msg;
 
 send_burst:
 	/* Determine which burst should be sent */
@@ -173,10 +184,11 @@ send_burst:
 
 	LOGP_LCHAND(lchan, LOGL_DEBUG, "Scheduled at fn=%u burst=%u\n", br->fn, br->bid);
 
-	/* If we have sent the last (4/4) burst */
-	if ((*mask & 0x0f) == 0x0f) {
-		/* Confirm data / traffic sending (pass ownership of the prim) */
-		l1sched_lchan_emit_data_cnf(lchan, br->fn);
+	if (br->bid == 3) {
+		/* Confirm data / traffic sending (pass ownership of the msgb/prim) */
+		l1sched_lchan_emit_data_cnf(lchan, lchan->prim,
+					    GSM_TDMA_FN_SUB(br->fn, 3));
+		lchan->prim = NULL;
 	}
 
 	return 0;

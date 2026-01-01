@@ -43,7 +43,9 @@ struct osmosap_entity {
 
 struct osmol1_entity {
 	int (*l1_traffic_ind)(struct osmocom_ms *ms, struct msgb *msg);
+	int (*l1_gprs_ul_block_cnf)(struct osmocom_ms *ms, struct msgb *msg);
 	int (*l1_gprs_dl_block_ind)(struct osmocom_ms *ms, struct msgb *msg);
+	int (*l1_gprs_rts_ind)(struct osmocom_ms *ms, struct msgb *msg);
 };
 
 struct osmomncc_entity {
@@ -101,9 +103,9 @@ struct osmocom_ms {
 	/* GPRS */
 	struct gprs_settings gprs;
 	struct osmobb_ms_gmm_layer gmmlayer;
+	struct osmo_fsm_inst *grr_fi;
 
-	/* Audio I/O */
-	struct gapk_io_state *gapk_io;
+	struct tch_state *tch_state;
 
 	void *lua_state;
 	int lua_cb_ref;

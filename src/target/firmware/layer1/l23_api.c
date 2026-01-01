@@ -289,6 +289,7 @@ static void l1ctl_rx_dm_est_req(struct msgb *msg)
 		/* Mode */
 		l1a_tch_mode_set(est_req->tch_mode);
 		l1a_audio_mode_set(est_req->audio_mode);
+		l1a_tch_flags_set(est_req->tch_flags);
 
 		/* Sync */
 		l1s.tch_sync = 1;	/* can be set without locking */
@@ -385,11 +386,10 @@ static void l1ctl_rx_rach_req(struct msgb *msg)
 	struct l1ctl_info_ul *ul = (struct l1ctl_info_ul *) l1h->data;
 	struct l1ctl_rach_req *rach_req = (struct l1ctl_rach_req *) ul->payload;
 
-	printd("L1CTL_RACH_REQ (ra=0x%02x, offset=%d, combined=%d)\n",
-		rach_req->ra, ntohs(rach_req->offset), rach_req->combined);
+	printd("L1CTL_RACH_REQ (ra=0x%02x, offset=%d, combined=%d, uic=0x%02x)\n",
+		rach_req->ra, ntohs(rach_req->offset), rach_req->combined, rach_req->uic);
 
-	l1a_rach_req(ntohs(rach_req->offset), rach_req->combined,
-		rach_req->ra);
+	l1a_rach_req(ntohs(rach_req->offset), rach_req->combined, rach_req->ra, rach_req->uic);
 }
 
 /* receive a L1CTL_DATA_REQ from L23 */
@@ -522,7 +522,7 @@ static void l1ctl_rx_ccch_mode_req(struct msgb *msg)
 }
 
 /* Transmit a L1CTL_TCH_MODE_CONF */
-static void l1ctl_tx_tch_mode_conf(uint8_t tch_mode, uint8_t audio_mode)
+static void l1ctl_tx_tch_mode_conf(uint8_t tch_mode, uint8_t audio_mode, uint8_t tch_flags)
 {
 	struct msgb *msg = l1ctl_msgb_alloc(L1CTL_TCH_MODE_CONF);
 	struct l1ctl_tch_mode_conf *mode_conf;
@@ -530,6 +530,7 @@ static void l1ctl_tx_tch_mode_conf(uint8_t tch_mode, uint8_t audio_mode)
 				msgb_put(msg, sizeof(*mode_conf));
 	mode_conf->tch_mode = tch_mode;
 	mode_conf->audio_mode = audio_mode;
+	mode_conf->tch_flags = l1s.tch_flags;
 	mode_conf->tch_loop_mode = l1s.tch_loop_mode;
 
 	l1_queue_for_l2(msg);
@@ -543,11 +544,14 @@ static void l1ctl_rx_tch_mode_req(struct msgb *msg)
 		(struct l1ctl_tch_mode_req *) l1h->data;
 	uint8_t tch_mode = tch_mode_req->tch_mode;
 	uint8_t audio_mode = tch_mode_req->audio_mode;
+	uint8_t tch_flags = tch_mode_req->tch_flags;
 
 	printd("L1CTL_TCH_MODE_REQ (tch_mode=0x%02x audio_mode=0x%02x)\n",
 		tch_mode, audio_mode);
+
 	tch_mode = l1a_tch_mode_set(tch_mode);
 	audio_mode = l1a_audio_mode_set(audio_mode);
+	tch_flags = l1a_tch_flags_set(tch_flags);
 
 	audio_set_enabled(tch_mode, audio_mode);
 
@@ -555,7 +559,7 @@ static void l1ctl_rx_tch_mode_req(struct msgb *msg)
 	l1s.tch_loop_mode = tch_mode_req->tch_loop_mode;
 	/* TODO: Handle AMR codecs from tch_mode_req if tch_mode_req->tch_mode==GSM48_CMODE_SPEECH_AMR */
 
-	l1ctl_tx_tch_mode_conf(tch_mode, audio_mode);
+	l1ctl_tx_tch_mode_conf(tch_mode, audio_mode, tch_flags);
 }
 
 /* receive a L1CTL_NEIGH_PM_REQ from L23 */

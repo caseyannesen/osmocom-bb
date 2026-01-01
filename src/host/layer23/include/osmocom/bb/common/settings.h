@@ -1,9 +1,12 @@
 #ifndef _settings_h
 #define _settings_h
 
+#include <stdbool.h>
+
 #include <osmocom/core/utils.h>
 #include <osmocom/core/linuxlist.h>
 #include <osmocom/gsm/protocol/gsm_23_003.h>
+#include <osmocom/gsm/protocol/gsm_04_08.h>
 #include <osmocom/gsm/gsm23003.h>
 #include <osmocom/gsm/gsm48.h>
 
@@ -24,41 +27,73 @@ enum mncc_handler_t {
 	MNCC_HANDLER_DUMMY,
 };
 
-/* TCH frame I/O handler */
-enum audio_io_handler {
+/* TCH I/O handler for voice calls */
+enum tch_voice_io_handler {
 	/* No handler, drop frames */
-	AUDIO_IOH_NONE = 0,
+	TCH_VOICE_IOH_NONE = 0,
 	/* libosmo-gapk based handler */
-	AUDIO_IOH_GAPK,
+	TCH_VOICE_IOH_GAPK,
 	/* L1 PHY (e.g. Calypso DSP) */
-	AUDIO_IOH_L1PHY,
+	TCH_VOICE_IOH_L1PHY,
 	/* External MNCC app (via MNCC socket) */
-	AUDIO_IOH_MNCC_SOCK,
+	TCH_VOICE_IOH_MNCC_SOCK,
 	/* Return to sender */
-	AUDIO_IOH_LOOPBACK,
+	TCH_VOICE_IOH_LOOPBACK,
 };
 
-extern const struct value_string audio_io_handler_names[];
-static inline const char *audio_io_handler_name(enum audio_io_handler val)
-{ return get_value_string(audio_io_handler_names, val); }
+extern const struct value_string tch_voice_io_handler_names[];
+static inline const char *tch_voice_io_handler_name(enum tch_voice_io_handler val)
+{ return get_value_string(tch_voice_io_handler_names, val); }
 
-/* TCH frame I/O format */
-enum audio_io_format {
-	/* RTP format (RFC3551 for FR/EFR, RFC5993 for HR, RFC4867 for AMR) */
-	AUDIO_IOF_RTP,
+/* TCH I/O handler for data calls */
+enum tch_data_io_handler {
+	/* No handler, drop frames */
+	TCH_DATA_IOH_NONE = 0,
+	/* UNIX socket */
+	TCH_DATA_IOH_UNIX_SOCK,
+	/* Return to sender */
+	TCH_DATA_IOH_LOOPBACK,
+};
+
+extern const struct value_string tch_data_io_handler_names[];
+static inline const char *tch_data_io_handler_name(enum tch_data_io_handler val)
+{ return get_value_string(tch_data_io_handler_names, val); }
+
+/* TCH I/O format for voice calls */
+enum tch_voice_io_format {
+	/* RFC3551 for FR/EFR, RFC5993 for HR, RFC4867 for AMR */
+	TCH_VOICE_IOF_RTP,
 	/* Texas Instruments format, used by Calypso based phones (e.g. Motorola C1xx) */
-	AUDIO_IOF_TI,
+	TCH_VOICE_IOF_TI,
 };
 
-extern const struct value_string audio_io_format_names[];
-static inline const char *audio_io_format_name(enum audio_io_format val)
-{ return get_value_string(audio_io_format_names, val); }
+extern const struct value_string tch_voice_io_format_names[];
+static inline const char *tch_voice_io_format_name(enum tch_voice_io_format val)
+{ return get_value_string(tch_voice_io_format_names, val); }
 
-struct audio_settings {
-	enum audio_io_handler	io_handler;
-	enum audio_io_format	io_format;
+/* TCH I/O format for data calls */
+enum tch_data_io_format {
+	/* Osmocom format, used by trxcon and virtphy */
+	TCH_DATA_IOF_OSMO,
+	/* Texas Instruments format, used by Calypso based phones (e.g. Motorola C1xx) */
+	TCH_DATA_IOF_TI,
+};
+
+extern const struct value_string tch_data_io_format_names[];
+static inline const char *tch_data_io_format_name(enum tch_data_io_format val)
+{ return get_value_string(tch_data_io_format_names, val); }
+
+struct tch_voice_settings {
+	enum tch_voice_io_handler io_handler;
+	enum tch_voice_io_format io_format;
 	char alsa_output_dev[128];
 	char alsa_input_dev[128];
+};
+
+struct tch_data_settings {
+	enum tch_data_io_handler io_handler;
+	enum tch_data_io_format io_format;
+	char unix_socket_path[128];
 };
 
 struct test_sim_settings {
@@ -82,6 +117,67 @@ struct test_sim_settings {
 	} locigprs;
 };
 
+/* Data (CSD) call type and rate, values like in the '<speed>' part of 'AT+CBST'.
+ * See 3GPP TS 27.007, section 6.7 "Select bearer service type +CBST". */
+enum data_call_type_rate {
+	DATA_CALL_TR_AUTO		= 0,
+	DATA_CALL_TR_V21_300		= 1,
+	DATA_CALL_TR_V22_1200		= 2,
+	DATA_CALL_TR_V23_1200_75	= 3,
+	DATA_CALL_TR_V22bis_2400	= 4,
+	DATA_CALL_TR_V26ter_2400	= 5,
+	DATA_CALL_TR_V32_4800		= 6,
+	DATA_CALL_TR_V32_9600		= 7,
+	DATA_CALL_TR_V34_9600		= 12,
+	DATA_CALL_TR_V34_14400		= 14,
+	DATA_CALL_TR_V34_19200		= 15,
+	DATA_CALL_TR_V34_28800		= 16,
+	DATA_CALL_TR_V34_33600		= 17,
+	DATA_CALL_TR_V120_1200		= 34,
+	DATA_CALL_TR_V120_2400		= 36,
+	DATA_CALL_TR_V120_4800		= 38,
+	DATA_CALL_TR_V120_9600		= 39,
+	DATA_CALL_TR_V120_14400		= 43,
+	DATA_CALL_TR_V120_19200		= 47,
+	DATA_CALL_TR_V120_28800		= 48,
+	DATA_CALL_TR_V120_38400		= 49,
+	DATA_CALL_TR_V120_48000		= 50,
+	DATA_CALL_TR_V120_56000		= 51,
+	DATA_CALL_TR_V110_300		= 65,
+	DATA_CALL_TR_V110_1200		= 66,
+	DATA_CALL_TR_V110_2400		= 68,
+	DATA_CALL_TR_V110_4800		= 70,
+	DATA_CALL_TR_V110_9600		= 71,
+	DATA_CALL_TR_V110_14400		= 75,
+	DATA_CALL_TR_V110_19200		= 79,
+	DATA_CALL_TR_V110_28800		= 80,
+	DATA_CALL_TR_V110_38400		= 81,
+	DATA_CALL_TR_V110_48000		= 82,
+	DATA_CALL_TR_V110_56000		= 83,
+	DATA_CALL_TR_V110_64000		= 84,
+	DATA_CALL_TR_BTR_56000		= 115,
+	DATA_CALL_TR_BTR_64000		= 116,
+	DATA_CALL_TR_PIAFS32k_32000	= 120,
+	DATA_CALL_TR_PIAFS64k_64000	= 121,
+	DATA_CALL_TR_MMEDIA_28800	= 130,
+	DATA_CALL_TR_MMEDIA_32000	= 131,
+	DATA_CALL_TR_MMEDIA_33600	= 132,
+	DATA_CALL_TR_MMEDIA_56000	= 133,
+	DATA_CALL_TR_MMEDIA_64000	= 134,
+};
+
+/* Data (CSD) call parameters */
+struct data_call_params {
+	enum data_call_type_rate	type_rate;
+	enum gsm48_bcap_transp		transp;
+
+	/* async call parameters */
+	bool				is_async;
+	unsigned int			nr_stop_bits;
+	unsigned int			nr_data_bits;
+	enum gsm48_bcap_parity		parity;
+};
+
 struct gsm_settings {
 	char			layer2_socket_path[128];
 	char			sap_socket_path[128];
@@ -90,8 +186,9 @@ struct gsm_settings {
 	/* MNCC handler */
 	enum mncc_handler_t	mncc_handler;
 
-	/* Audio settings */
-	struct audio_settings	audio;
+	/* TCH settings */
+	struct tch_voice_settings tch_voice;
+	struct tch_data_settings tch_data;
 
 	/* IMEI */
 	char			imei[GSM23003_IMEI_NUM_DIGITS + 1];
@@ -144,6 +241,7 @@ struct gsm_settings {
 	uint8_t			p_gsm;
 	uint8_t			e_gsm;
 	uint8_t			r_gsm;
+	uint8_t			er_gsm;
 	uint8_t			dcs;
 	uint8_t			gsm_850;
 	uint8_t			pcs;
@@ -162,6 +260,18 @@ struct gsm_settings {
 	uint8_t			half_v3;
 	uint8_t			ch_cap; /* channel capability */
 	int8_t			min_rxlev_dbm; /* min dBm to access */
+
+	/* CSD modes */
+	bool			csd_tch_f144;
+	bool			csd_tch_f96;
+	bool			csd_tch_f48;
+	bool			csd_tch_h48;
+	bool			csd_tch_f24;
+	bool			csd_tch_h24;
+
+	/* support for ASCI */
+	bool			vgcs; /* support of VGCS */
+	bool			vbs; /* support of VBS */
 
 	/* radio */
 	uint16_t		dsc_max;
@@ -186,6 +296,15 @@ struct gsm_settings {
 
 	/* Timeout for GSM 03.22 C7 state */
 	uint8_t			any_timeout;
+
+	/* ASCI settings */
+	bool			uplink_release_local;
+	bool			asci_allow_any;
+
+	/* call parameters */
+	struct {
+		struct data_call_params data;
+	} call_params;
 };
 
 struct gsm_settings_abbrev {

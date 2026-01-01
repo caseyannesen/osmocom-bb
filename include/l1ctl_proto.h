@@ -59,6 +59,8 @@ enum {
 	L1CTL_GPRS_DL_BLOCK_IND		= 0x23,
 	/* Extended (11-bit) RACH (see 3GPP TS 05.02, section 5.2.7) */
 	L1CTL_EXT_RACH_REQ		= 0x24,
+	L1CTL_GPRS_RTS_IND		= 0x25,
+	L1CTL_GPRS_UL_BLOCK_CNF		= 0x26,
 };
 
 enum ccch_mode {
@@ -145,6 +147,7 @@ struct l1ctl_tch_mode_conf {
 		uint8_t start_codec;
 		uint8_t codecs_bitmask;
 	} amr;
+	uint8_t tch_flags;
 } __attribute__((packed));
 
 /* data on the CCCH was found. This is following the header */
@@ -218,13 +221,17 @@ struct l1ctl_tch_mode_req {
 		uint8_t start_codec;
 		uint8_t codecs_bitmask;
 	} amr;
+	uint8_t tch_flags;
 } __attribute__((packed));
+
+#define L1CTL_TCH_FLAG_RXONLY	(1<<0)  /* TX disabled */
 
 /* the l1_info_ul header is in front */
 struct l1ctl_rach_req {
 	uint8_t ra;
 	uint8_t combined;
 	uint16_t offset;
+	uint8_t uic;
 } __attribute__((packed));
 
 
@@ -264,6 +271,7 @@ struct l1ctl_dm_est_req {
 	};
 	uint8_t tch_mode;
 	uint8_t audio_mode;
+	uint8_t tch_flags;
 } __attribute__((packed));
 
 struct l1ctl_dm_freq_req {
@@ -350,6 +358,7 @@ struct l1ctl_gprs_ul_tbf_cfg_req {
 	uint8_t tbf_ref;
 	uint8_t slotmask;
 	uint8_t padding[2];
+	uint32_t start_fn; /* TBF Starting Time (absolute Fn) */
 } __attribute__((packed));
 
 /* payload of L1CTL_GPRS_DL_TBF_CFG_REQ */
@@ -358,6 +367,7 @@ struct l1ctl_gprs_dl_tbf_cfg_req {
 	uint8_t slotmask;
 	uint8_t dl_tfi;
 	uint8_t padding[1];
+	uint32_t start_fn; /* TBF Starting Time (absolute Fn) */
 } __attribute__((packed));
 
 /* part of L1CTL_GPRS_{UL,DL}_BLOCK_{REQ,IND} */
@@ -382,6 +392,20 @@ struct l1ctl_gprs_dl_block_ind {
 		uint8_t rx_lev;		/* RxLev 0..63 */
 	} meas;
 	uint8_t usf;
+	uint8_t data[0];
+} __attribute__((packed));
+
+/* payload of L1CTL_GPRS_RTS_IND */
+struct l1ctl_gprs_rts_ind {
+	uint32_t fn;
+	uint8_t tn;
+	uint8_t usf;
+} __attribute__((packed));
+
+/* payload of L1CTL_GPRS_UL_BLOCK_CNF */
+struct l1ctl_gprs_ul_block_cnf {
+	uint32_t fn;
+	uint8_t tn;
 	uint8_t data[0];
 } __attribute__((packed));
 

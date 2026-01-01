@@ -39,6 +39,7 @@
 #include <osmocom/bb/mobile/app_mobile.h>
 #include <osmocom/bb/mobile/gsm480_ss.h>
 #include <osmocom/bb/mobile/gsm411_sms.h>
+#include <osmocom/bb/mobile/gsm44068_gcc_bcc.h>
 #include <osmocom/vty/telnet_interface.h>
 #include <osmocom/vty/misc.h>
 
@@ -48,9 +49,27 @@ struct cmd_node support_node = {
 	1
 };
 
-struct cmd_node audio_node = {
-	AUDIO_NODE,
-	"%s(audio)# ",
+struct cmd_node tch_voice_node = {
+	TCH_VOICE_NODE,
+	"%s(tch-voice)# ",
+	1
+};
+
+struct cmd_node tch_data_node = {
+	TCH_DATA_NODE,
+	"%s(tch-data)# ",
+	1
+};
+
+struct cmd_node vgcs_node = {
+	VGCS_NODE,
+	"%s(group-call)# ",
+	1
+};
+
+struct cmd_node vbs_node = {
+	VBS_NODE,
+	"%s(broadcast-call)# ",
 	1
 };
 
@@ -73,6 +92,32 @@ int vty_check_number(struct vty *vty, const char *number)
 	}
 	if (number[0] == '\0' || (number[0] == '+' && number[1] == '\0')) {
 		vty_out(vty, "Given number has no digits!%s", VTY_NEWLINE);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+int vty_check_callref(struct vty *vty, const char *number)
+{
+	int i, ii = strlen(number);
+
+	/* First check digits, so that a false command result the following error message. */
+	for (i = 0; i < ii; i++) {
+		if (!(number[i] >= '0' && number[i] <= '9')) {
+			vty_out(vty, "Invalid digit '%c' in callref!%s",
+				number[i], VTY_NEWLINE);
+			return -EINVAL;
+		}
+	}
+
+	if (ii < 1) {
+		vty_out(vty, "Given callref has no digits!%s", VTY_NEWLINE);
+		return -EINVAL;
+	}
+
+	if (ii > 8) {
+		vty_out(vty, "Given callref is too long!%s", VTY_NEWLINE);
 		return -EINVAL;
 	}
 
@@ -334,6 +379,36 @@ DEFUN(show_forb_la, show_forb_la_cmd, "show forbidden location-area MS_NAME",
 	return CMD_SUCCESS;
 }
 
+#define SHOW_ASCI_STR SHOW_STR "Display information about ASCI items\nName of MS (see \"show ms\")\n"
+
+DEFUN(show_asci_calls, show_asci_calls_cmd, "show asci MS_NAME calls",
+	SHOW_ASCI_STR "Display ongoing ASCI calls")
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	gsm44068_dump_calls(ms, l23_vty_printf, vty);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(show_asci_neighbors, show_asci_neighbors_cmd, "show asci MS_NAME neighbors",
+	SHOW_ASCI_STR "Display neigbor cells of ongoing or last ASCI call")
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	gsm48_si10_dump(ms->cellsel.si, l23_vty_printf, vty);
+
+	return CMD_SUCCESS;
+}
+
 DEFUN(monitor_network, monitor_network_cmd, "monitor network MS_NAME",
 	"Monitor...\nMonitor network information\nName of MS (see \"show ms\")")
 {
@@ -419,16 +494,25 @@ DEFUN(network_select, network_select_cmd,
 	return CMD_SUCCESS;
 }
 
-DEFUN(call, call_cmd, "call MS_NAME (NUMBER|emergency|answer|hangup|hold)",
-	"Make a call\nName of MS (see \"show ms\")\nPhone number to call "
-	"(Use digits '0123456789*#abc', and '+' to dial international)\n"
-	"Make an emergency call\nAnswer an incoming call\nHangup a call\n"
-	"Hold current active call\n")
+#define CALL_CMD "call MS_NAME"
+#define CALL_CMD_DESC \
+	"Call related commands\n" \
+	"Name of MS (see \"show ms\")\n"
+
+DEFUN(call_num, call_num_cmd,
+      CALL_CMD " NUMBER [(voice|data|fax)]",
+      CALL_CMD_DESC
+      "Phone number to call "
+      "(Use digits '0123456789*#abc', and '+' to dial international)\n"
+      "Initiate a regular voice call (default)\n"
+      "Initiate a data call (UDI or 3.1 kHz audio)\n"
+      "Initiate a data call (Facsimile group 3)\n")
 {
 	struct osmocom_ms *ms;
 	struct gsm_settings *set;
 	struct gsm_settings_abbrev *abbrev;
-	char *number;
+	enum gsm_call_type call_type;
+	const char *number;
 
 	ms = l23_vty_get_ms(argv[0], vty);
 	if (!ms)
@@ -441,35 +525,76 @@ DEFUN(call, call_cmd, "call MS_NAME (NUMBER|emergency|answer|hangup|hold)",
 		return CMD_WARNING;
 	}
 
-	number = (char *)argv[1];
+	number = argv[1];
+	llist_for_each_entry(abbrev, &set->abbrev, list) {
+		if (!strcmp(number, abbrev->abbrev)) {
+			number = abbrev->number;
+			vty_out(vty, "Dialing number '%s'%s", number,
+				VTY_NEWLINE);
+			break;
+		}
+	}
+
+	if (vty_check_number(vty, number))
+		return CMD_WARNING;
+
+	if (argc < 3 || !strcmp(argv[2], "voice"))
+		call_type = GSM_CALL_T_VOICE; /* implicit default */
+	else if (!strcmp(argv[2], "data"))
+		call_type = GSM_CALL_T_DATA;
+	else if (!strcmp(argv[2], "fax"))
+		call_type = GSM_CALL_T_DATA_FAX;
+	else
+		return CMD_WARNING;
+
+	mncc_call(ms, number, call_type);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call, call_cmd,
+      CALL_CMD " (emergency|answer|hangup|hold)",
+      CALL_CMD_DESC
+      "Make an emergency call\n"
+      "Answer an incoming call\n"
+      "Hangup a call\n"
+      "Hold current active call\n")
+{
+	struct osmocom_ms *ms;
+	struct gsm_settings *set;
+	const char *number;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+	set = &ms->settings;
+
+	if (set->ch_cap == GSM_CAP_SDCCH) {
+		vty_out(vty, "Basic call is not supported for SDCCH only "
+			"mobile%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	number = argv[1];
 	if (!strcmp(number, "emergency"))
-		mncc_call(ms, number);
+		mncc_call(ms, number, GSM_CALL_T_VOICE);
 	else if (!strcmp(number, "answer"))
 		mncc_answer(ms);
 	else if (!strcmp(number, "hangup"))
 		mncc_hangup(ms);
 	else if (!strcmp(number, "hold"))
 		mncc_hold(ms);
-	else {
-		llist_for_each_entry(abbrev, &set->abbrev, list) {
-			if (!strcmp(number, abbrev->abbrev)) {
-				number = abbrev->number;
-				vty_out(vty, "Dialing number '%s'%s", number,
-					VTY_NEWLINE);
-				break;
-			}
-		}
-		if (vty_check_number(vty, number))
-			return CMD_WARNING;
-		mncc_call(ms, number);
-	}
+	else /* shall not happen */
+		OSMO_ASSERT(0);
 
 	return CMD_SUCCESS;
 }
 
-DEFUN(call_retr, call_retr_cmd, "call MS_NAME retrieve [NUMBER]",
-	"Make a call\nName of MS (see \"show ms\")\n"
-	"Retrieve call on hold\nNumber of call to retrieve")
+DEFUN(call_retr, call_retr_cmd,
+      CALL_CMD " retrieve [NUMBER]",
+      CALL_CMD_DESC
+      "Retrieve call on hold\n"
+      "Number of call to retrieve\n")
 {
 	struct osmocom_ms *ms;
 
@@ -507,9 +632,36 @@ DEFUN(send_custom_sres, send_custom_sres_cmd, "sres MS_NAME SRES",
 	return CMD_SUCCESS;
 }
 
-DEFUN(call_dtmf, call_dtmf_cmd, "call MS_NAME dtmf DIGITS",
-	"Make a call\nName of MS (see \"show ms\")\n"
-	"One or more DTMF digits to transmit")
+DEFUN(send_custom_sres, send_custom_sres_cmd, "sres MS_NAME SRES",
+	"send custom sres\n")
+{
+	struct osmocom_ms *ms;
+	struct msgb *nmsg;
+	struct gsm48_mm_event *nmme;
+	uint8_t sres[4];
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	nmsg = gsm48_mmevent_msgb_alloc(GSM48_MM_EVENT_AUTH_RESPONSE);
+	if (!nmsg)
+		return CMD_WARNING;
+	
+	nmme = (struct gsm48_mm_event *) nmsg->data;
+	osmo_hexparse(argv[1], nmme->sres, sizeof(nmme->sres));
+	gsm48_mmevent_msg(ms, nmsg);
+
+	vty_out(vty, "SRES sent %s %s", osmo_hexdump_nospc(nmme->sres, sizeof(nmme->sres)), VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_dtmf, call_dtmf_cmd,
+      CALL_CMD " dtmf DIGITS",
+      CALL_CMD_DESC
+      "Send DTMF (Dual-Tone Multi-Frequency) tones\n"
+      "One or more DTMF digits to transmit\n")
 {
 	struct osmocom_ms *ms;
 	struct gsm_settings *set;
@@ -528,6 +680,290 @@ DEFUN(call_dtmf, call_dtmf_cmd, "call MS_NAME dtmf DIGITS",
 	mncc_dtmf(ms, (char *)argv[1]);
 
 	return CMD_SUCCESS;
+}
+
+#define CALL_PARAMS_CMD \
+	CALL_CMD " params"
+#define CALL_PARAMS_CMD_DESC \
+	CALL_CMD_DESC \
+	"Call related parameters\n"
+
+#define CALL_PARAMS_DATA_CMD \
+	CALL_PARAMS_CMD " data"
+#define CALL_PARAMS_DATA_CMD_DESC \
+	CALL_PARAMS_CMD_DESC \
+	"Parameters for data calls\n"
+
+#define CFG_TCH_DATA_CALL_PARAMS_CMD \
+	"call-params"
+#define CFG_TCH_DATA_CALL_PARAMS_CMD_DESC \
+	"Parameters for data calls\n"
+
+/* only supported rate/type ('<speed>' in AT+CBST) values are listed here */
+static const struct value_string data_type_rate_descs[] = {
+#if 0
+	/* TODO: rates below 2400 bps are not supported */
+	{ DATA_CALL_TR_V21_300,		"300 bps (V.21)" },
+	{ DATA_CALL_TR_V22_1200,	"1200 bps (V.22)" },
+	{ DATA_CALL_TR_V23_1200_75,	"1200/75 bps (V.23)" },
+#endif
+	{ DATA_CALL_TR_V22bis_2400,	"2400 bps (V.22bis)" },
+	{ DATA_CALL_TR_V26ter_2400,	"2400 bps (V.26ter)" },
+	{ DATA_CALL_TR_V32_4800,	"4800 bps (V.32)" },
+	{ DATA_CALL_TR_V32_9600,	"9600 bps (V.32)" },
+#if 0
+	/* TODO: V.34 is not supported, see notes in bcap_data_set[] */
+	{ DATA_CALL_TR_V34_9600,	"9600 bps (V.34)" },
+	/* TODO: rates below 2400 bps are not supported */
+	{ DATA_CALL_TR_V110_300,	"300 bps (V.110)" },
+	{ DATA_CALL_TR_V110_1200,	"1200 bps (V.110)" },
+#endif
+	{ DATA_CALL_TR_V110_2400,	"2400 bps (V.110 or X.31 flag stuffing)" },
+	{ DATA_CALL_TR_V110_4800,	"4800 bps (V.110 or X.31 flag stuffing)" },
+	{ DATA_CALL_TR_V110_9600,	"9600 bps (V.110 or X.31 flag stuffing)" },
+#if 0
+	/* TODO: 14400 bps is not supported */
+	{ DATA_CALL_TR_V110_14400,	"14400 bps (V.110 or X.31 flag stuffing)" },
+#endif
+	{ 0, NULL }
+};
+
+static void _data_type_rate_cmd_string(void *ctx, struct cmd_element *cmd)
+{
+
+	const struct value_string *vs;
+	char *string;
+
+	string = talloc_asprintf(ctx, "%s type-rate (", cmd->string);
+	for (vs = &data_type_rate_descs[0]; vs->value || vs->str; vs++)
+		string = talloc_asprintf_append(string, "%u|", vs->value);
+	string[strlen(string) - 1] = ')';
+	cmd->string = string;
+}
+
+DEFUN(cfg_ms_tch_data_cp_type_rate,
+      cfg_ms_tch_data_cp_type_rate_cmd,
+      CFG_TCH_DATA_CALL_PARAMS_CMD /* generated */,
+      CFG_TCH_DATA_CALL_PARAMS_CMD_DESC /* generated */)
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct data_call_params *cp = &ms->settings.call_params.data;
+	int val;
+
+	val = atoi(argv[0]);
+	OSMO_ASSERT(get_value_string_or_null(data_type_rate_descs, val) != NULL);
+	cp->type_rate = (enum data_call_type_rate)val;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_params_data_type_rate,
+      call_params_data_type_rate_cmd,
+      CALL_PARAMS_DATA_CMD /* generated */,
+      CALL_PARAMS_DATA_CMD_DESC /* generated */)
+{
+	vty->index = l23_vty_get_ms(argv[0], vty);
+	if (vty->index == NULL)
+		return CMD_WARNING;
+
+	return cfg_ms_tch_data_cp_type_rate(self, vty, argc - 1, argv + 1);
+}
+
+#define CALL_PARAMS_CE_CMD \
+	"ce (transparent|non-transparent) [prefer]"
+#define CALL_PARAMS_CE_CMD_DESC \
+	"Connection element (does not apply to FAX calls)\n" \
+	"Transparent connection\n" \
+	"Non-transparent connection (RLP)\n" \
+	"Prefer the selected mode, but also accept other(s)\n"
+
+DEFUN(cfg_ms_tch_data_cp_ce,
+      cfg_ms_tch_data_cp_ce_cmd,
+      CFG_TCH_DATA_CALL_PARAMS_CMD " " CALL_PARAMS_CE_CMD,
+      CFG_TCH_DATA_CALL_PARAMS_CMD_DESC CALL_PARAMS_CE_CMD_DESC)
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct data_call_params *cp = &ms->settings.call_params.data;
+
+	if (!strcmp(argv[0], "transparent")) {
+		if (argc > 1)
+			cp->transp = GSM48_BCAP_TR_TR_PREF;
+		else
+			cp->transp = GSM48_BCAP_TR_TRANSP;
+	} else if (!strcmp(argv[0], "non-transparent")) {
+		if (argc > 1)
+			cp->transp = GSM48_BCAP_TR_RLP_PREF;
+		else
+			cp->transp = GSM48_BCAP_TR_RLP;
+	} else { /* should not happen */
+		return CMD_WARNING;
+	}
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_params_data_ce,
+      call_params_data_ce_cmd,
+      CALL_PARAMS_DATA_CMD " " CALL_PARAMS_CE_CMD,
+      CALL_PARAMS_DATA_CMD_DESC CALL_PARAMS_CE_CMD_DESC)
+{
+	vty->index = l23_vty_get_ms(argv[0], vty);
+	if (vty->index == NULL)
+		return CMD_WARNING;
+
+	return cfg_ms_tch_data_cp_ce(self, vty, argc - 1, argv + 1);
+}
+
+#define CALL_PARAMS_SYNC_ASYNC_CMD "(sync|async)"
+#define CALL_PARAMS_SYNC_ASYNC_CMD_DESC \
+	"Synchronous connection (always used for FAX calls)\n" \
+	"Asynchronous connection (does not apply to FAX calls)\n"
+
+DEFUN(cfg_ms_tch_data_cp_sync_async,
+      cfg_ms_tch_data_cp_sync_async_cmd,
+      CFG_TCH_DATA_CALL_PARAMS_CMD " " CALL_PARAMS_SYNC_ASYNC_CMD,
+      CFG_TCH_DATA_CALL_PARAMS_CMD_DESC CALL_PARAMS_SYNC_ASYNC_CMD_DESC)
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct data_call_params *cp = &ms->settings.call_params.data;
+
+	cp->is_async = (argv[0][0] == 'a');
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_params_data_sync_async,
+      call_params_data_sync_async_cmd,
+      CALL_PARAMS_DATA_CMD " " CALL_PARAMS_SYNC_ASYNC_CMD,
+      CALL_PARAMS_DATA_CMD_DESC CALL_PARAMS_SYNC_ASYNC_CMD_DESC)
+{
+	vty->index = l23_vty_get_ms(argv[0], vty);
+	if (vty->index == NULL)
+		return CMD_WARNING;
+
+	return cfg_ms_tch_data_cp_sync_async(self, vty, argc - 1, argv + 1);
+}
+
+#define CALL_PARAMS_ASYNC_CMD "async"
+#define CALL_PARAMS_ASYNC_CMD_DESC \
+	"Asynchronous connection params (does not apply to FAX calls)\n"
+
+#define CALL_PARAMS_ASYNC_NR_STOP_BITS_CMD \
+	CALL_PARAMS_ASYNC_CMD " nr-stop-bits <1-2>"
+#define CALL_PARAMS_ASYNC_NR_STOP_BITS_CMD_DESC \
+	CALL_PARAMS_ASYNC_CMD_DESC \
+	"Number of stop bits (soft-UART config)\n" \
+	"Number of stop bits (default: 1)\n"
+
+DEFUN(cfg_ms_tch_data_cp_async_nr_stop_bits,
+      cfg_ms_tch_data_cp_async_nr_stop_bits_cmd,
+      CFG_TCH_DATA_CALL_PARAMS_CMD " " CALL_PARAMS_ASYNC_NR_STOP_BITS_CMD,
+      CFG_TCH_DATA_CALL_PARAMS_CMD_DESC CALL_PARAMS_ASYNC_NR_STOP_BITS_CMD_DESC)
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct data_call_params *cp = &ms->settings.call_params.data;
+
+	cp->nr_stop_bits = atoi(argv[0]);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_params_data_async_nr_stop_bits,
+      call_params_data_async_nr_stop_bits_cmd,
+      CALL_PARAMS_DATA_CMD " " CALL_PARAMS_ASYNC_NR_STOP_BITS_CMD,
+      CALL_PARAMS_DATA_CMD_DESC CALL_PARAMS_ASYNC_NR_STOP_BITS_CMD_DESC)
+{
+	vty->index = l23_vty_get_ms(argv[0], vty);
+	if (vty->index == NULL)
+		return CMD_WARNING;
+
+	return cfg_ms_tch_data_cp_async_nr_stop_bits(self, vty, argc - 1, argv + 1);
+}
+
+#define CALL_PARAMS_ASYNC_NR_DATA_BITS_CMD \
+	CALL_PARAMS_ASYNC_CMD " nr-data-bits <7-8>"
+#define CALL_PARAMS_ASYNC_NR_DATA_BITS_CMD_DESC \
+	CALL_PARAMS_ASYNC_CMD_DESC \
+	"Number of data bits (soft-UART config)\n" \
+	"Number of data bits (default: 8)\n"
+
+DEFUN(cfg_ms_tch_data_cp_async_nr_data_bits,
+      cfg_ms_tch_data_cp_async_nr_data_bits_cmd,
+      CFG_TCH_DATA_CALL_PARAMS_CMD " " CALL_PARAMS_ASYNC_NR_DATA_BITS_CMD,
+      CFG_TCH_DATA_CALL_PARAMS_CMD_DESC CALL_PARAMS_ASYNC_NR_DATA_BITS_CMD_DESC)
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct data_call_params *cp = &ms->settings.call_params.data;
+
+	cp->nr_data_bits = atoi(argv[0]);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_params_data_async_nr_data_bits,
+      call_params_data_async_nr_data_bits_cmd,
+      CALL_PARAMS_DATA_CMD " " CALL_PARAMS_ASYNC_NR_DATA_BITS_CMD,
+      CALL_PARAMS_DATA_CMD_DESC CALL_PARAMS_ASYNC_NR_DATA_BITS_CMD_DESC)
+{
+	vty->index = l23_vty_get_ms(argv[0], vty);
+	if (vty->index == NULL)
+		return CMD_WARNING;
+
+	return cfg_ms_tch_data_cp_async_nr_data_bits(self, vty, argc - 1, argv + 1);
+}
+
+static const struct value_string async_parity_names[] = {
+	{ GSM48_BCAP_PAR_NONE,		"none" },
+	{ GSM48_BCAP_PAR_EVEN,		"even" },
+	{ GSM48_BCAP_PAR_ODD,		"odd" },
+	{ GSM48_BCAP_PAR_ONE,		"mark" },
+	{ GSM48_BCAP_PAR_ZERO,		"space" },
+	{ 0, NULL }
+};
+
+static const struct value_string async_parity_descs[] = {
+	{ GSM48_BCAP_PAR_NONE,		"No parity bit (default)" },
+	{ GSM48_BCAP_PAR_EVEN,		"Even parity" },
+	{ GSM48_BCAP_PAR_ODD,		"Odd parity" },
+	{ GSM48_BCAP_PAR_ONE,		"Always 1" },
+	{ GSM48_BCAP_PAR_ZERO,		"Always 0" },
+	{ 0, NULL }
+};
+
+#define CALL_PARAMS_ASYNC_PARITY_CMD \
+	CALL_PARAMS_ASYNC_CMD " parity"
+#define CALL_PARAMS_ASYNC_PARITY_CMD_DESC \
+	CALL_PARAMS_ASYNC_CMD_DESC \
+	"Parity mode (soft-UART config)\n"
+
+DEFUN(cfg_ms_tch_data_cp_async_parity,
+      cfg_ms_tch_data_cp_async_parity_cmd,
+      CFG_TCH_DATA_CALL_PARAMS_CMD /* generated */,
+      CFG_TCH_DATA_CALL_PARAMS_CMD_DESC
+      CALL_PARAMS_ASYNC_PARITY_CMD_DESC /* generated */)
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct data_call_params *cp = &ms->settings.call_params.data;
+	int val;
+
+	val = get_string_value(async_parity_names, argv[0]);
+	OSMO_ASSERT(val >= 0); /* should not happen */
+	cp->parity = (enum gsm48_bcap_parity)val;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(call_params_data_async_parity,
+      call_params_data_async_parity_cmd,
+      CALL_PARAMS_DATA_CMD /* generated */,
+      CALL_PARAMS_DATA_CMD_DESC
+      CALL_PARAMS_ASYNC_PARITY_CMD_DESC /* generated */)
+{
+	vty->index = l23_vty_get_ms(argv[0], vty);
+	if (vty->index == NULL)
+		return CMD_WARNING;
+
+	return cfg_ms_tch_data_cp_async_parity(self, vty, argc - 1, argv + 1);
 }
 
 DEFUN(sms, sms_cmd, "sms MS_NAME NUMBER .LINE",
@@ -606,6 +1042,146 @@ DEFUN(service, service_cmd, "service MS_NAME (*#06#|*#21#|*#67#|*#61#|*#62#"
 	ss_send(ms, argv[1], 0);
 
 	return CMD_SUCCESS;
+}
+
+#define VGCS_STR "Make a voice group call\nName of MS (see \"show ms\")\n"
+#define VGCS_CMDS "(CALLREF|hangup|leave|talk|listen)"
+#define VGCS_CMDS_TXT \
+      "Voice group to call or join\nHangup voice group call\nLeave voice group call\nBecome talker\nBecome listener"
+
+/* This command enters VGCS call node with given MS. */
+DEFUN(vgcs_enter, vgcs_enter_cmd, "group-call MS_NAME",
+      VGCS_STR)
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	vty->index = ms;
+	vty->node = VGCS_NODE;
+
+	return CMD_SUCCESS;
+}
+
+/* These commands perform VGCS on VGCS node. */
+DEFUN(vgcs, vgcs_cmd, VGCS_CMDS,
+      VGCS_CMDS_TXT)
+{
+	struct osmocom_ms *ms = vty->index;
+	struct gsm_settings *set;
+	const char *command;
+
+	set = &ms->settings;
+
+	if (!set->vgcs) {
+		vty_out(vty, "VGCS not supported by this mobile, please enable VGCS support%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	if (set->ch_cap == GSM_CAP_SDCCH) {
+		vty_out(vty, "ASCI call is not supported for SDCCH only mobile%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	command = (char *)argv[0];
+	if (!strcmp(command, "hangup"))
+		gcc_bcc_hangup(ms);
+	else if (!strcmp(command, "leave"))
+		gcc_leave(ms);
+	else if (!strcmp(command, "talk"))
+		gcc_talk(ms);
+	else if (!strcmp(command, "listen"))
+		gcc_listen(ms);
+	else {
+		if (vty_check_callref(vty, command))
+			return CMD_WARNING;
+		gcc_bcc_call(ms, GSM48_PDISC_GROUP_CC, command);
+	}
+
+	return CMD_SUCCESS;
+}
+
+/* These commands perform VGCS on given MS without entering the VGCS node. */
+DEFUN(vgcs_direct, vgcs_direct_cmd, "group-call MS_NAME " VGCS_CMDS,
+      VGCS_STR VGCS_CMDS_TXT)
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	vty->index = ms;
+	return vgcs(self, vty, argc - 1, argv + 1);
+}
+
+#define VBS_STR "Make a voice broadcast call\nName of MS (see \"show ms\")\n"
+#define VBS_CMDS "(CALLREF|hangup)"
+#define VBS_CMDS_TXT \
+      "Voice broadcast to call or join\nHangup voice broadcast call"
+
+/* This command enters VBS call node with given MS. */
+DEFUN(vbs_enter, vbs_enter_cmd, "broadcast-call MS_NAME",
+      VBS_STR)
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	vty->index = ms;
+	vty->node = VBS_NODE;
+
+	return CMD_SUCCESS;
+}
+
+/* These commands perform VBS on VBS node. */
+DEFUN(vbs, vbs_cmd, VBS_CMDS,
+      VBS_CMDS_TXT)
+{
+	struct osmocom_ms *ms = vty->index;
+	struct gsm_settings *set;
+	const char *command;
+
+	set = &ms->settings;
+
+	if (!set->vbs) {
+		vty_out(vty, "VBS not supported by this mobile, please enable VBS support%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	if (set->ch_cap == GSM_CAP_SDCCH) {
+		vty_out(vty, "ASCI call is not supported for SDCCH only mobile%s", VTY_NEWLINE);
+		return CMD_WARNING;
+	}
+
+	command = (char *)argv[0];
+	if (!strcmp(command, "hangup"))
+		gcc_bcc_hangup(ms);
+	else {
+		if (vty_check_callref(vty, command))
+			return CMD_WARNING;
+		gcc_bcc_call(ms, GSM48_PDISC_BCAST_CC, command);
+	}
+
+	return CMD_SUCCESS;
+}
+
+/* These commands perform VBS on given MS without entering the VBS node. */
+DEFUN(vbs_direct, vbs_direct_cmd, "broadcast-call MS_NAME " VBS_CMDS,
+      VBS_STR VBS_CMDS_TXT)
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	vty->index = ms;
+	return vbs(self, vty, argc - 1, argv + 1);
 }
 
 #define TEST_CMD_DESC	"Special commands for testing\n"
@@ -1044,12 +1620,13 @@ static void config_write_ms(struct vty *vty, struct osmocom_ms *ms)
 	SUP_WRITE(p_gsm, "p-gsm");
 	SUP_WRITE(e_gsm, "e-gsm");
 	SUP_WRITE(r_gsm, "r-gsm");
-	SUP_WRITE(pcs, "gsm-850");
+	SUP_WRITE(er_gsm, "er-gsm");
+	SUP_WRITE(gsm_850, "gsm-850");
 	SUP_WRITE(gsm_480, "gsm-480");
 	SUP_WRITE(gsm_450, "gsm-450");
 	SUP_WRITE(dcs, "dcs");
 	SUP_WRITE(pcs, "pcs");
-	if (sup->r_gsm || sup->e_gsm || sup->p_gsm)
+	if (sup->er_gsm || sup->r_gsm || sup->e_gsm || sup->p_gsm)
 		if (!l23_vty_hide_default || sup->class_900 != set->class_900)
 			vty_out(vty, "  class-900 %d%s", set->class_900,
 				VTY_NEWLINE);
@@ -1090,6 +1667,12 @@ static void config_write_ms(struct vty *vty, struct osmocom_ms *ms)
 	SUP_WRITE(full_v3, "full-speech-v3");
 	SUP_WRITE(half_v1, "half-speech-v1");
 	SUP_WRITE(half_v3, "half-speech-v3");
+	SUP_WRITE(csd_tch_f144, "full-data-14400");
+	SUP_WRITE(csd_tch_f96, "full-data-9600");
+	SUP_WRITE(csd_tch_f48, "full-data-4800");
+	SUP_WRITE(csd_tch_h48, "half-data-4800");
+	SUP_WRITE(csd_tch_f24, "full-data-2400");
+	SUP_WRITE(csd_tch_h24, "half-data-2400");
 	if (!l23_vty_hide_default || sup->min_rxlev_dbm != set->min_rxlev_dbm)
 		vty_out(vty, "  min-rxlev %d%s", set->min_rxlev_dbm,
 			VTY_NEWLINE);
@@ -1098,27 +1681,65 @@ static void config_write_ms(struct vty *vty, struct osmocom_ms *ms)
 	if (!l23_vty_hide_default || set->skip_max_per_band)
 		vty_out(vty, "  %sskip-max-per-band%s",
 			(set->skip_max_per_band) ? "" : "no ", VTY_NEWLINE);
+	SUP_WRITE(vgcs, "vgcs");
+	SUP_WRITE(vbs, "vbs");
 	if (!l23_vty_hide_default || set->any_timeout != MOB_C7_DEFLT_ANY_TIMEOUT)
 		vty_out(vty, " c7-any-timeout %d%s",
 			set->any_timeout, VTY_NEWLINE);
+	if (!l23_vty_hide_default || !set->uplink_release_local)
+		vty_out(vty, " %suplink-release-local%s",
+			(!set->uplink_release_local) ? "no " : "", VTY_NEWLINE);
+	if (!l23_vty_hide_default || set->asci_allow_any)
+		vty_out(vty, " %sasci-allow-any%s",
+			(set->asci_allow_any) ? "" : "no ", VTY_NEWLINE);
 
-	vty_out(vty, " audio%s", VTY_NEWLINE);
+	vty_out(vty, " tch-voice%s", VTY_NEWLINE);
 	vty_out(vty, "  io-handler %s%s",
-		audio_io_handler_name(set->audio.io_handler), VTY_NEWLINE);
-	if (set->audio.io_handler == AUDIO_IOH_GAPK) {
+		tch_voice_io_handler_name(set->tch_voice.io_handler), VTY_NEWLINE);
+	if (set->tch_voice.io_handler == TCH_VOICE_IOH_GAPK) {
 		vty_out(vty, "  io-tch-format %s%s",
-			audio_io_format_name(set->audio.io_format), VTY_NEWLINE);
+			tch_voice_io_format_name(set->tch_voice.io_format), VTY_NEWLINE);
 		vty_out(vty, "  alsa-output-dev %s%s",
-			set->audio.alsa_output_dev, VTY_NEWLINE);
+			&set->tch_voice.alsa_output_dev[0], VTY_NEWLINE);
 		vty_out(vty, "  alsa-input-dev %s%s",
-			set->audio.alsa_input_dev, VTY_NEWLINE);
+			&set->tch_voice.alsa_input_dev[0], VTY_NEWLINE);
 	}
 
-	if (!llist_empty(&set->multi_imsi_list)) {
-		vty_out(vty, " multi-imsi%s", VTY_NEWLINE);
-		llist_for_each_entry(imsi_entry, &set->multi_imsi_list, entry)
-			vty_out(vty, "  imsi %s%s", imsi_entry->imsi, VTY_NEWLINE);
+	vty_out(vty, " tch-data%s", VTY_NEWLINE);
+	vty_out(vty, "  io-handler %s%s",
+		tch_data_io_handler_name(set->tch_data.io_handler), VTY_NEWLINE);
+	vty_out(vty, "  io-tch-format %s%s",
+		tch_data_io_format_name(set->tch_data.io_format), VTY_NEWLINE);
+	if (set->tch_data.io_handler == TCH_DATA_IOH_UNIX_SOCK) {
+		vty_out(vty, "  unix-socket %s%s",
+			set->tch_data.unix_socket_path, VTY_NEWLINE);
 	}
+
+	vty_out(vty, "  call-params type-rate %d%s",
+		(int)set->call_params.data.type_rate, VTY_NEWLINE);
+	switch (set->call_params.data.transp) {
+	case GSM48_BCAP_TR_TR_PREF:
+		vty_out(vty, "  call-params ce transparent prefer%s", VTY_NEWLINE);
+		break;
+	case GSM48_BCAP_TR_TRANSP:
+		vty_out(vty, "  call-params ce transparent%s", VTY_NEWLINE);
+		break;
+	case GSM48_BCAP_TR_RLP_PREF:
+		vty_out(vty, "  call-params ce non-transparent prefer%s", VTY_NEWLINE);
+		break;
+	case GSM48_BCAP_TR_RLP:
+		vty_out(vty, "  call-params ce non-transparent%s", VTY_NEWLINE);
+		break;
+	}
+	vty_out(vty, "  call-params %s%s",
+		set->call_params.data.is_async ? "async" : "sync", VTY_NEWLINE);
+	vty_out(vty, "  call-params async nr-stop-bits %u%s",
+		set->call_params.data.nr_stop_bits, VTY_NEWLINE);
+	vty_out(vty, "  call-params async nr-data-bits %u%s",
+		set->call_params.data.nr_data_bits, VTY_NEWLINE);
+	vty_out(vty, "  call-params async parity %s%s",
+		get_value_string(async_parity_names, set->call_params.data.parity),
+		VTY_NEWLINE);
 
 	if (ms->lua_script)
 		vty_out(vty, " lua-script %s%s", ms->lua_script, VTY_NEWLINE);
@@ -1757,6 +2378,48 @@ DEFUN(cfg_ms_any_timeout, cfg_ms_any_timeout_cmd, "c7-any-timeout <0-255>",
 	return CMD_SUCCESS;
 }
 
+DEFUN(cfg_ms_no_uplink_release_local, cfg_ms_no_uplink_release_local_cmd, "no uplink-release-local",
+	NO_STR "Release L2 on uplink of VGCS channel normally. Release locally when UPLINK FREE is received.")
+{
+	struct osmocom_ms *ms = vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	set->uplink_release_local = false;
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_uplink_release_local, cfg_ms_uplink_release_local_cmd, "uplink-release-local",
+	"Release L2 on uplink of VGCS channel locally after receiving UPLINK FREE.")
+{
+	struct osmocom_ms *ms = vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	set->uplink_release_local = true;
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_asci_allow_any, cfg_ms_asci_allow_any_cmd, "asci-allow-any",
+	"Allow any ASCI related call feature, even if service is limited or SIM invalid.")
+{
+	struct osmocom_ms *ms = vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	set->asci_allow_any = true;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_no_asci_allow_any, cfg_ms_no_asci_allow_any_cmd, "no asci-allow-any",
+	NO_STR "Do not allow any ASCI related call feature, if service is not normal.")
+{
+	struct osmocom_ms *ms = vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	set->asci_allow_any = false;
+
+	return CMD_SUCCESS;
+}
+
 static int config_write_dummy(struct vty *vty)
 {
 	return CMD_SUCCESS;
@@ -1771,8 +2434,10 @@ DEFUN(cfg_ms_support, cfg_ms_support_cmd, "support",
 	return CMD_SUCCESS;
 }
 
-#define SUP_EN(cfg, cfg_cmd, item, cmd, desc, restart) \
-DEFUN(cfg, cfg_cmd, cmd, "Enable " desc "support") \
+#define SUP_EN(item, cmd, desc, restart) \
+DEFUN(cfg_ms_sup_en_##item, \
+      cfg_ms_sup_en_##item##_cmd, \
+      cmd, "Enable " desc "support") \
 { \
 	struct osmocom_ms *ms = vty->index; \
 	struct gsm_settings *set = &ms->settings; \
@@ -1789,8 +2454,10 @@ DEFUN(cfg, cfg_cmd, cmd, "Enable " desc "support") \
 	return CMD_SUCCESS; \
 }
 
-#define SUP_DI(cfg, cfg_cmd, item, cmd, desc, restart) \
-DEFUN(cfg, cfg_cmd, "no " cmd, NO_STR "Disable " desc " support") \
+#define SUP_DI(item, cmd, desc, restart) \
+DEFUN(cfg_ms_sup_di_##item, \
+      cfg_ms_sup_di_##item##_cmd, \
+      "no " cmd, NO_STR "Disable " desc " support") \
 { \
 	struct osmocom_ms *ms = vty->index; \
 	struct gsm_settings *set = &ms->settings; \
@@ -1807,8 +2474,15 @@ DEFUN(cfg, cfg_cmd, "no " cmd, NO_STR "Disable " desc " support") \
 	return CMD_SUCCESS; \
 }
 
-#define SET_EN(cfg, cfg_cmd, item, cmd, desc, restart) \
-DEFUN(cfg, cfg_cmd, cmd, "Enable " desc "support") \
+#define SUP_EN_DI(item, cmd, desc, restart) \
+	SUP_EN(item, cmd, desc, restart); \
+	SUP_DI(item, cmd, desc, restart)
+
+
+#define SET_EN(item, cmd, desc, restart) \
+DEFUN(cfg_ms_set_en_##item, \
+      cfg_ms_set_en_##item##_cmd, \
+      cmd, "Enable " desc "support") \
 { \
 	struct osmocom_ms *ms = vty->index; \
 	struct gsm_settings *set = &ms->settings; \
@@ -1818,8 +2492,10 @@ DEFUN(cfg, cfg_cmd, cmd, "Enable " desc "support") \
 	return CMD_SUCCESS; \
 }
 
-#define SET_DI(cfg, cfg_cmd, item, cmd, desc, restart) \
-DEFUN(cfg, cfg_cmd, "no " cmd, NO_STR "Disable " desc " support") \
+#define SET_DI(item, cmd, desc, restart) \
+DEFUN(cfg_ms_set_di_##item, \
+      cfg_ms_set_di_##item##_cmd, \
+      "no " cmd, NO_STR "Disable " desc " support") \
 { \
 	struct osmocom_ms *ms = vty->index; \
 	struct gsm_settings *set = &ms->settings; \
@@ -1876,52 +2552,76 @@ DEFUN(multi_imsi_list, multi_imsi_list_cmd, "multi-imsi MS_NAME print",
 	return multi_imsi_print_impl(vty, ms);
 }
 
-SET_EN(cfg_ms_sup_dtmf, cfg_ms_sup_dtmf_cmd, cc_dtmf, "dtmf", "DTMF", 0);
-SET_DI(cfg_ms_sup_no_dtmf, cfg_ms_sup_no_dtmf_cmd, cc_dtmf, "dtmf", "DTMF", 0);
-SUP_EN(cfg_ms_sup_sms, cfg_ms_sup_sms_cmd, sms_ptp, "sms", "SMS", 0);
-SUP_DI(cfg_ms_sup_no_sms, cfg_ms_sup_no_sms_cmd, sms_ptp, "sms", "SMS", 0);
-SUP_EN(cfg_ms_sup_a5_1, cfg_ms_sup_a5_1_cmd, a5_1, "a5/1", "A5/1", 0);
-SUP_DI(cfg_ms_sup_no_a5_1, cfg_ms_sup_no_a5_1_cmd, a5_1, "a5/1", "A5/1", 0);
-SUP_EN(cfg_ms_sup_a5_2, cfg_ms_sup_a5_2_cmd, a5_2, "a5/2", "A5/2", 0);
-SUP_DI(cfg_ms_sup_no_a5_2, cfg_ms_sup_no_a5_2_cmd, a5_2, "a5/2", "A5/2", 0);
-SUP_EN(cfg_ms_sup_a5_3, cfg_ms_sup_a5_3_cmd, a5_3, "a5/3", "A5/3", 0);
-SUP_DI(cfg_ms_sup_no_a5_3, cfg_ms_sup_no_a5_3_cmd, a5_3, "a5/3", "A5/3", 0);
-SUP_EN(cfg_ms_sup_a5_4, cfg_ms_sup_a5_4_cmd, a5_4, "a5/4", "A5/4", 0);
-SUP_DI(cfg_ms_sup_no_a5_4, cfg_ms_sup_no_a5_4_cmd, a5_4, "a5/4", "A5/4", 0);
-SUP_EN(cfg_ms_sup_a5_5, cfg_ms_sup_a5_5_cmd, a5_5, "a5/5", "A5/5", 0);
-SUP_DI(cfg_ms_sup_no_a5_5, cfg_ms_sup_no_a5_5_cmd, a5_5, "a5/5", "A5/5", 0);
-SUP_EN(cfg_ms_sup_a5_6, cfg_ms_sup_a5_6_cmd, a5_6, "a5/6", "A5/6", 0);
-SUP_DI(cfg_ms_sup_no_a5_6, cfg_ms_sup_no_a5_6_cmd, a5_6, "a5/6", "A5/6", 0);
-SUP_EN(cfg_ms_sup_a5_7, cfg_ms_sup_a5_7_cmd, a5_7, "a5/7", "A5/7", 0);
-SUP_DI(cfg_ms_sup_no_a5_7, cfg_ms_sup_no_a5_7_cmd, a5_7, "a5/7", "A5/7", 0);
-SUP_EN(cfg_ms_sup_p_gsm, cfg_ms_sup_p_gsm_cmd, p_gsm, "p-gsm", "P-GSM (900)",
-	1);
-SUP_DI(cfg_ms_sup_no_p_gsm, cfg_ms_sup_no_p_gsm_cmd, p_gsm, "p-gsm",
-	"P-GSM (900)", 1);
-SUP_EN(cfg_ms_sup_e_gsm, cfg_ms_sup_e_gsm_cmd, e_gsm, "e-gsm", "E-GSM (850)",
-	1);
-SUP_DI(cfg_ms_sup_no_e_gsm, cfg_ms_sup_no_e_gsm_cmd, e_gsm, "e-gsm",
-	"E-GSM (850)", 1);
-SUP_EN(cfg_ms_sup_r_gsm, cfg_ms_sup_r_gsm_cmd, r_gsm, "r-gsm", "R-GSM (850)",
-	1);
-SUP_DI(cfg_ms_sup_no_r_gsm, cfg_ms_sup_no_r_gsm_cmd, r_gsm, "r-gsm",
-	"R-GSM (850)", 1);
-SUP_EN(cfg_ms_sup_dcs, cfg_ms_sup_dcs_cmd, dcs, "dcs", "DCS (1800)", 1);
-SUP_DI(cfg_ms_sup_no_dcs, cfg_ms_sup_no_dcs_cmd, dcs, "dcs", "DCS (1800)", 1);
-SUP_EN(cfg_ms_sup_gsm_850, cfg_ms_sup_gsm_850_cmd, gsm_850, "gsm-850",
-	"GSM 850", 1);
-SUP_DI(cfg_ms_sup_no_gsm_850, cfg_ms_sup_no_gsm_850_cmd, gsm_850, "gsm-850",
-	"GSM 850", 1);
-SUP_EN(cfg_ms_sup_pcs, cfg_ms_sup_pcs_cmd, pcs, "pcs", "PCS (1900)", 1);
-SUP_DI(cfg_ms_sup_no_pcs, cfg_ms_sup_no_pcs_cmd, pcs, "pcs", "PCS (1900)", 1);
-SUP_EN(cfg_ms_sup_gsm_480, cfg_ms_sup_gsm_480_cmd, gsm_480, "gsm-480",
-	"GSM 480", 1);
-SUP_DI(cfg_ms_sup_no_gsm_480, cfg_ms_sup_no_gsm_480_cmd, gsm_480, "gsm-480",
-	"GSM 480", 1);
-SUP_EN(cfg_ms_sup_gsm_450, cfg_ms_sup_gsm_450_cmd, gsm_450, "gsm-450",
-	"GSM 450", 1);
-SUP_DI(cfg_ms_sup_no_gsm_450, cfg_ms_sup_no_gsm_450_cmd, gsm_450, "gsm-450",
-	"GSM 450", 1);
+/* Multi-IMSI config */
+DEFUN(cfg_ms_multi_imsi, cfg_ms_multi_imsi_cmd, "multi-imsi",
+	"Configure multiple IMSIs to care for")
+{
+	vty->node = MULTI_IMSI_NODE;
+
+	return CMD_SUCCESS;
+}
+
+
+static int multi_imsi_print_impl(struct vty *vty, struct osmocom_ms *ms)
+{
+	struct gsm_settings *set = &ms->settings;
+	struct gsm_subscriber_creds *creds_node;
+	int i = 0;
+
+	llist_for_each_entry(creds_node, &set->multi_imsi_list, entry)
+		vty_out(vty, "  #%02d %s 0x%08x %s%s", ++i,
+			creds_node->imsi, creds_node->tmsi,
+			creds_node->online ? "online" : "",
+			VTY_NEWLINE);
+
+	return CMD_SUCCESS;
+}
+
+
+
+DEFUN(cfg_multi_imsi_list, cfg_multi_imsi_list_cmd, "print",
+	"Print all stored IMSIs")
+{
+	struct osmocom_ms *ms = vty->index;
+	return multi_imsi_print_impl(vty, ms);
+}
+
+
+DEFUN(multi_imsi_list, multi_imsi_list_cmd, "multi-imsi MS_NAME print",
+	"Multi-IMSI configuration\nMS name\nPrint all stored IMSIs")
+{
+	struct osmocom_ms *ms;
+
+	ms = l23_vty_get_ms(argv[0], vty);
+	if (!ms)
+		return CMD_WARNING;
+
+	return multi_imsi_print_impl(vty, ms);
+}
+
+#define SET_EN_DI(item, cmd, desc, restart) \
+	SET_EN(item, cmd, desc, restart); \
+	SET_DI(item, cmd, desc, restart)
+
+
+SET_EN_DI(cc_dtmf, "dtmf", "DTMF", 0);
+SUP_EN_DI(sms_ptp, "sms", "SMS", 0);
+SUP_EN_DI(a5_1, "a5/1", "A5/1", 0);
+SUP_EN_DI(a5_2, "a5/2", "A5/2", 0);
+SUP_EN_DI(a5_3, "a5/3", "A5/3", 0);
+SUP_EN_DI(a5_4, "a5/4", "A5/4", 0);
+SUP_EN_DI(a5_5, "a5/5", "A5/5", 0);
+SUP_EN_DI(a5_6, "a5/6", "A5/6", 0);
+SUP_EN_DI(a5_7, "a5/7", "A5/7", 0);
+SUP_EN_DI(p_gsm, "p-gsm", "P-GSM (900)", 1);
+SUP_EN_DI(e_gsm, "e-gsm", "E-GSM (850)", 1);
+SUP_EN_DI(r_gsm, "r-gsm", "R-GSM (850)", 1);
+SUP_EN_DI(er_gsm, "er-gsm", "ER-GSM (850)", 1);
+SUP_EN_DI(dcs, "dcs", "DCS (1800)", 1);
+SUP_EN_DI(gsm_850, "gsm-850", "GSM 850", 1);
+SUP_EN_DI(pcs, "pcs", "PCS (1900)", 1);
+SUP_EN_DI(gsm_480, "gsm-480", "GSM 480", 1);
+SUP_EN_DI(gsm_450, "gsm-450", "GSM 450", 1);
 
 DEFUN(cfg_ms_sup_class_900, cfg_ms_sup_class_900_cmd, "class-900 (1|2|3|4|5)",
 	"Select power class for GSM 900\n"
@@ -2137,26 +2837,18 @@ DEFUN(cfg_ms_sup_ch_cap, cfg_ms_sup_ch_cap_cmd,
 	return CMD_SUCCESS;
 }
 
-SUP_EN(cfg_ms_sup_full_v1, cfg_ms_sup_full_v1_cmd, full_v1, "full-speech-v1",
-	"Full rate speech V1", 0);
-SUP_DI(cfg_ms_sup_no_full_v1, cfg_ms_sup_no_full_v1_cmd, full_v1,
-	"full-speech-v1", "Full rate speech V1", 0);
-SUP_EN(cfg_ms_sup_full_v2, cfg_ms_sup_full_v2_cmd, full_v2, "full-speech-v2",
-	"Full rate speech V2 (EFR)", 0);
-SUP_DI(cfg_ms_sup_no_full_v2, cfg_ms_sup_no_full_v2_cmd, full_v2,
-	"full-speech-v2", "Full rate speech V2 (EFR)", 0);
-SUP_EN(cfg_ms_sup_full_v3, cfg_ms_sup_full_v3_cmd, full_v3, "full-speech-v3",
-	"Full rate speech V3 (AMR)", 0);
-SUP_DI(cfg_ms_sup_no_full_v3, cfg_ms_sup_no_full_v3_cmd, full_v3,
-	"full-speech-v3", "Full rate speech V3 (AMR)", 0);
-SUP_EN(cfg_ms_sup_half_v1, cfg_ms_sup_half_v1_cmd, half_v1, "half-speech-v1",
-	"Half rate speech V1", 0);
-SUP_DI(cfg_ms_sup_no_half_v1, cfg_ms_sup_no_half_v1_cmd, half_v1,
-	"half-speech-v1", "Half rate speech V1", 0);
-SUP_EN(cfg_ms_sup_half_v3, cfg_ms_sup_half_v3_cmd, half_v3, "half-speech-v3",
-	"Half rate speech V3 (AMR)", 0);
-SUP_DI(cfg_ms_sup_no_half_v3, cfg_ms_sup_no_half_v3_cmd, half_v3,
-	"half-speech-v3", "Half rate speech V3 (AMR)", 0);
+SUP_EN_DI(full_v1, "full-speech-v1", "Full rate speech V1", 0);
+SUP_EN_DI(full_v2, "full-speech-v2", "Full rate speech V2 (EFR)", 0);
+SUP_EN_DI(full_v3, "full-speech-v3", "Full rate speech V3 (AMR)", 0);
+SUP_EN_DI(half_v1, "half-speech-v1", "Half rate speech V1", 0);
+SUP_EN_DI(half_v3, "half-speech-v3", "Half rate speech V3 (AMR)", 0);
+
+SUP_EN_DI(csd_tch_f144, "full-data-14400", "CSD TCH/F14.4", 0);
+SUP_EN_DI(csd_tch_f96, "full-data-9600", "CSD TCH/F9.6", 0);
+SUP_EN_DI(csd_tch_f48, "full-data-4800", "CSD TCH/F4.8", 0);
+SUP_EN_DI(csd_tch_h48, "half-data-4800", "CSD TCH/H4.8", 0);
+SUP_EN_DI(csd_tch_f24, "full-data-2400", "CSD TCH/F2.4", 0);
+SUP_EN_DI(csd_tch_h24, "half-data-2400", "CSD TCH/H2.4", 0);
 
 DEFUN(cfg_ms_sup_min_rxlev, cfg_ms_sup_min_rxlev_cmd, "min-rxlev <-110--47>",
 	"Set the minimum receive level to select a cell\n"
@@ -2208,88 +2900,91 @@ DEFUN(cfg_ms_sup_no_skip_max_per_band, cfg_ms_sup_no_skip_max_per_band_cmd,
 	return CMD_SUCCESS;
 }
 
-/* per audio config */
-DEFUN(cfg_ms_audio, cfg_ms_audio_cmd, "audio",
-	"Configure audio settings")
+SUP_EN_DI(vgcs, "vgcs", "Voice Group Call Service (VGCS)", 0);
+SUP_EN_DI(vbs, "vbs", "Voice Broadcast Service (VBS)", 0);
+
+/* TCH config */
+DEFUN(cfg_ms_tch_voice,
+      cfg_ms_tch_voice_cmd,
+      "tch-voice", "Configure TCH (Traffic CHannel) params for voice calls\n")
 {
-	vty->node = AUDIO_NODE;
+	vty->node = TCH_VOICE_NODE;
 	return CMD_SUCCESS;
 }
 
-static int set_audio_io_handler(struct vty *vty, enum audio_io_handler val)
-{
-	struct osmocom_ms *ms = (struct osmocom_ms *) vty->index;
-	struct gsm_settings *set = &ms->settings;
+ALIAS_DEPRECATED(cfg_ms_tch_voice, /* alias to 'tch-voice' */
+		 cfg_ms_audio_cmd,
+		 "audio", "(deprecated alias for 'tch-voice')\n");
 
-	/* Don't restart on unchanged value */
-	if (val == set->audio.io_handler)
-		return CMD_SUCCESS;
-	set->audio.io_handler = val;
-
-	/* Restart required */
-	vty_restart_if_started(vty, ms);
-
-	return CMD_SUCCESS;
-}
-
-DEFUN(cfg_ms_audio_io_handler, cfg_ms_audio_io_handler_cmd,
+DEFUN(cfg_ms_tch_voice_io_handler, cfg_ms_tch_voice_io_handler_cmd,
 	"io-handler (none|gapk|l1phy|mncc-sock|loopback)",
-	"Set TCH frame I/O handler\n"
+	"Set TCH frame I/O handler for voice calls\n"
 	"No handler, drop TCH frames (default)\n"
 	"libosmo-gapk based I/O handler (requires ALSA)\n"
 	"L1 PHY (e.g. Calypso DSP in Motorola C1xx phones)\n"
 	"External MNCC application (e.g. LCR) via MNCC socket\n"
 	"Return TCH frame payload back to sender\n")
 {
-	struct osmocom_ms *ms = (struct osmocom_ms *) vty->index;
-	int val = get_string_value(audio_io_handler_names, argv[0]);
+	int val = get_string_value(tch_voice_io_handler_names, argv[0]);
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct gsm_settings *set = &ms->settings;
 
-	if (val == AUDIO_IOH_MNCC_SOCK) {
+	OSMO_ASSERT(val >= 0);
+
+	if (val == TCH_VOICE_IOH_MNCC_SOCK) {
 		if (ms->settings.mncc_handler != MNCC_HANDLER_INTERNAL) {
-			vty_out(vty, "Audio I/O handler 'mncc-sock' can only be used "
+			vty_out(vty, "TCH voice I/O handler 'mncc-sock' can only be used "
 				"with MNCC handler 'external'%s", VTY_NEWLINE);
 			return CMD_WARNING;
 		}
 	}
 
 #ifndef WITH_GAPK_IO
-	if (val == AUDIO_IOH_GAPK) {
+	if (val == TCH_VOICE_IOH_GAPK) {
 		vty_out(vty, "GAPK I/O is not compiled in (--with-gapk-io)%s", VTY_NEWLINE);
 		return CMD_WARNING;
 	}
 #endif
 
-	return set_audio_io_handler(vty, val);
+	set->tch_voice.io_handler = (enum tch_voice_io_handler)val;
+
+	return CMD_SUCCESS;
 }
 
-DEFUN(cfg_ms_audio_no_io_handler, cfg_ms_audio_no_io_handler_cmd,
-	"no io-handler", NO_STR "Disable TCH frame processing")
+DEFUN(cfg_ms_tch_voice_no_io_handler, cfg_ms_tch_voice_no_io_handler_cmd,
+	"no io-handler", NO_STR "Disable TCH frame handling for voice calls\n")
 {
-	return set_audio_io_handler(vty, AUDIO_IOH_NONE);
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	set->tch_voice.io_handler = TCH_VOICE_IOH_NONE;
+
+	return CMD_SUCCESS;
 }
 
-DEFUN(cfg_ms_audio_io_tch_format, cfg_ms_audio_io_tch_format_cmd,
+DEFUN(cfg_ms_tch_voice_io_tch_format, cfg_ms_tch_voice_io_tch_format_cmd,
 	"io-tch-format (rtp|ti)",
 	"Set TCH I/O frame format used by the L1 PHY (for GAPK only)\n"
 	"RTP format (RFC3551 for FR/EFR, RFC5993 for HR, RFC4867 for AMR)\n"
 	"Texas Instruments format, used by Calypso based phones (e.g. Motorola C1xx)\n")
 {
-	int val = get_string_value(audio_io_format_names, argv[0]);
-	struct osmocom_ms *ms = (struct osmocom_ms *) vty->index;
+	int val = get_string_value(tch_voice_io_format_names, argv[0]);
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
 	struct gsm_settings *set = &ms->settings;
 
-	if (set->audio.io_handler != AUDIO_IOH_GAPK) {
+	OSMO_ASSERT(val >= 0);
+
+	if (set->tch_voice.io_handler != TCH_VOICE_IOH_GAPK) {
 		vty_out(vty, "This parameter is only valid for GAPK%s", VTY_NEWLINE);
 		return CMD_WARNING;
 	}
 
-	OSMO_ASSERT(val >= 0);
-	set->audio.io_format = val;
+	set->tch_voice.io_format = val;
 
 	return CMD_SUCCESS;
 }
 
-DEFUN(cfg_ms_audio_alsa_out_dev, cfg_ms_audio_alsa_out_dev_cmd,
+DEFUN(cfg_ms_tch_voice_alsa_out_dev, cfg_ms_tch_voice_alsa_out_dev_cmd,
 	"alsa-output-dev (default|NAME)",
 	"Set ALSA output (playback) device name (for GAPK only)\n"
 	"Default system playback device (default)\n"
@@ -2298,12 +2993,12 @@ DEFUN(cfg_ms_audio_alsa_out_dev, cfg_ms_audio_alsa_out_dev_cmd,
 	struct osmocom_ms *ms = vty->index;
 	struct gsm_settings *set = &ms->settings;
 
-	OSMO_STRLCPY_ARRAY(set->audio.alsa_output_dev, argv[0]);
+	OSMO_STRLCPY_ARRAY(set->tch_voice.alsa_output_dev, argv[0]);
 
 	return CMD_SUCCESS;
 }
 
-DEFUN(cfg_ms_audio_alsa_in_dev, cfg_ms_audio_alsa_in_dev_cmd,
+DEFUN(cfg_ms_tch_voice_alsa_in_dev, cfg_ms_tch_voice_alsa_in_dev_cmd,
 	"alsa-input-dev (default|NAME)",
 	"Set ALSA input (capture) device name (for GAPK only)\n"
 	"Default system recording device (default)\n"
@@ -2312,7 +3007,76 @@ DEFUN(cfg_ms_audio_alsa_in_dev, cfg_ms_audio_alsa_in_dev_cmd,
 	struct osmocom_ms *ms = vty->index;
 	struct gsm_settings *set = &ms->settings;
 
-	OSMO_STRLCPY_ARRAY(set->audio.alsa_input_dev, argv[0]);
+	OSMO_STRLCPY_ARRAY(set->tch_voice.alsa_input_dev, argv[0]);
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_tch_data,
+      cfg_ms_tch_data_cmd,
+      "tch-data", "Configure TCH (Traffic CHannel) params for data calls\n")
+{
+	vty->node = TCH_DATA_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_tch_data_io_handler,
+      cfg_ms_tch_data_io_handler_cmd,
+      "io-handler (none|unix-sock|loopback)",
+      "Set TCH frame I/O handler for data calls\n"
+      "No handler, drop TCH frames (default)\n"
+      "UNIX socket (path set by 'data-unix-socket')\n"
+      "Return TCH frame payload back to sender\n")
+{
+	int val = get_string_value(tch_data_io_handler_names, argv[0]);
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	OSMO_ASSERT(val >= 0);
+	set->tch_data.io_handler = (enum tch_data_io_handler)val;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_tch_data_no_io_handler,
+      cfg_ms_tch_data_no_io_handler_cmd,
+      "no io-handler", NO_STR "Disable TCH frame handling for data calls\n")
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	set->tch_data.io_handler = TCH_DATA_IOH_NONE;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_tch_data_io_tch_format,
+      cfg_ms_tch_data_io_tch_format_cmd,
+      "io-tch-format (osmo|ti)",
+      "Set TCH I/O frame format used by the L1 PHY\n"
+      "Osmocom format used by both trxcon and viryphy (default)\n"
+      "Texas Instruments format, used by Calypso based phones (e.g. Motorola C1xx)\n")
+{
+	int val = get_string_value(tch_data_io_format_names, argv[0]);
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	OSMO_ASSERT(val >= 0);
+	set->tch_data.io_format = val;
+
+	return CMD_SUCCESS;
+}
+
+DEFUN(cfg_ms_tch_data_unix_sock,
+      cfg_ms_tch_data_unix_sock_cmd,
+      "unix-socket PATH",
+      "Define UNIX socket path (for 'io-handler unix-sock')\n"
+      "UNIX socket path (default '/tmp/ms_data_' + MS_NAME)\n")
+{
+	struct osmocom_ms *ms = (struct osmocom_ms *)vty->index;
+	struct gsm_settings *set = &ms->settings;
+
+	OSMO_STRLCPY_ARRAY(set->tch_data.unix_socket_path, argv[0]);
 
 	return CMD_SUCCESS;
 }
@@ -2443,6 +3207,48 @@ int ms_vty_init(void)
 {
 	int rc;
 
+	_data_type_rate_cmd_string(NULL, &cfg_ms_tch_data_cp_type_rate_cmd);
+	_data_type_rate_cmd_string(NULL, &call_params_data_type_rate_cmd);
+
+	cfg_ms_tch_data_cp_type_rate_cmd.doc =
+		vty_cmd_string_from_valstr(NULL,
+					   data_type_rate_descs,
+					   CFG_TCH_DATA_CALL_PARAMS_CMD_DESC
+					   "Type and rate (values like in AT+CBST; "
+					   "see 3GPP TS 27.007, section 6.7)\n",
+					   "\n", "", 0);
+	call_params_data_type_rate_cmd.doc =
+		vty_cmd_string_from_valstr(NULL,
+					   data_type_rate_descs,
+					   CALL_PARAMS_DATA_CMD_DESC
+					   "Type and rate (values like in AT+CBST; "
+					   "see 3GPP TS 27.007, section 6.7)\n",
+					   "\n", "", 0);
+
+	cfg_ms_tch_data_cp_async_parity_cmd.string =
+		vty_cmd_string_from_valstr(NULL,
+					   async_parity_names,
+					   CFG_TCH_DATA_CALL_PARAMS_CMD " "
+					   CALL_PARAMS_ASYNC_PARITY_CMD " (",
+					   "|", ")", 0);
+	call_params_data_async_parity_cmd.string =
+		vty_cmd_string_from_valstr(NULL,
+					   async_parity_names,
+					   CALL_PARAMS_DATA_CMD " "
+					   CALL_PARAMS_ASYNC_PARITY_CMD " (",
+					   "|", ")", 0);
+
+	cfg_ms_tch_data_cp_async_parity_cmd.doc =
+		vty_cmd_string_from_valstr(NULL,
+					   async_parity_descs,
+					   cfg_ms_tch_data_cp_async_parity_cmd.doc,
+					   "\n", "", 0);
+	call_params_data_async_parity_cmd.doc =
+		vty_cmd_string_from_valstr(NULL,
+					   async_parity_descs,
+					   call_params_data_async_parity_cmd.doc,
+					   "\n", "", 0);
+
 	if ((rc = l23_vty_init(config_write, l23_vty_signal_cb)) < 0)
 		return rc;
 
@@ -2453,6 +3259,8 @@ int ms_vty_init(void)
 	install_element_ve(&show_ba_cmd);
 	install_element_ve(&show_forb_la_cmd);
 	install_element_ve(&show_forb_plmn_cmd);
+	install_element_ve(&show_asci_calls_cmd);
+	install_element_ve(&show_asci_neighbors_cmd);
 	install_element_ve(&monitor_network_cmd);
 	install_element_ve(&no_monitor_network_cmd);
 	install_element_ve(&send_custom_sres_cmd);
@@ -2462,11 +3270,26 @@ int ms_vty_init(void)
 	install_element(ENABLE_NODE, &network_search_cmd);
 	install_element(ENABLE_NODE, &network_show_cmd);
 	install_element(ENABLE_NODE, &network_select_cmd);
+	install_element(ENABLE_NODE, &call_num_cmd);
 	install_element(ENABLE_NODE, &call_cmd);
 	install_element(ENABLE_NODE, &call_retr_cmd);
 	install_element(ENABLE_NODE, &call_dtmf_cmd);
+	install_element(ENABLE_NODE, &call_params_data_type_rate_cmd);
+	install_element(ENABLE_NODE, &call_params_data_ce_cmd);
+	install_element(ENABLE_NODE, &call_params_data_sync_async_cmd);
+	install_element(ENABLE_NODE, &call_params_data_async_nr_stop_bits_cmd);
+	install_element(ENABLE_NODE, &call_params_data_async_nr_data_bits_cmd);
+	install_element(ENABLE_NODE, &call_params_data_async_parity_cmd);
 	install_element(ENABLE_NODE, &sms_cmd);
 	install_element(ENABLE_NODE, &service_cmd);
+	install_element(ENABLE_NODE, &vgcs_enter_cmd);
+	install_element(ENABLE_NODE, &vgcs_direct_cmd);
+	install_node(&vgcs_node, config_write_dummy);
+	install_element(VGCS_NODE, &vgcs_cmd);
+	install_element(ENABLE_NODE, &vbs_enter_cmd);
+	install_element(ENABLE_NODE, &vbs_direct_cmd);
+	install_node(&vbs_node, config_write_dummy);
+	install_element(VBS_NODE, &vbs_cmd);
 	install_element(ENABLE_NODE, &test_reselection_cmd);
 	install_element(ENABLE_NODE, &delete_forbidden_plmn_cmd);
 	install_element(ENABLE_NODE, &multi_imsi_add_cmd);
@@ -2523,81 +3346,117 @@ int ms_vty_init(void)
 	install_element(MS_NODE, &cfg_ms_no_codec_half_cmd);
 	install_element(MS_NODE, &cfg_ms_abbrev_cmd);
 	install_element(MS_NODE, &cfg_ms_no_abbrev_cmd);
+	install_element(MS_NODE, &cfg_ms_tch_voice_cmd);
 	install_element(MS_NODE, &cfg_ms_audio_cmd);
+	install_element(MS_NODE, &cfg_ms_tch_data_cmd);
 	install_element(MS_NODE, &cfg_ms_neighbour_cmd);
 	install_element(MS_NODE, &cfg_ms_no_neighbour_cmd);
 	install_element(MS_NODE, &cfg_ms_any_timeout_cmd);
 	install_element(MS_NODE, &cfg_ms_sms_store_cmd);
 	install_element(MS_NODE, &cfg_ms_no_sms_store_cmd);
+	install_element(MS_NODE, &cfg_ms_uplink_release_local_cmd);
+	install_element(MS_NODE, &cfg_ms_no_uplink_release_local_cmd);
+	install_element(MS_NODE, &cfg_ms_asci_allow_any_cmd);
+	install_element(MS_NODE, &cfg_ms_no_asci_allow_any_cmd);
 	install_element(MS_NODE, &cfg_ms_support_cmd);
 	install_element(MS_NODE, &cfg_ms_multi_imsi_cmd);
 	install_element(MULTI_IMSI_NODE, &cfg_multi_imsi_list_cmd);
 
 
 	install_node(&support_node, config_write_dummy);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_dtmf_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_dtmf_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_sms_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_sms_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_1_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_1_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_2_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_2_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_3_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_3_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_4_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_4_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_5_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_5_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_6_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_6_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_a5_7_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_a5_7_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_p_gsm_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_p_gsm_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_e_gsm_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_e_gsm_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_r_gsm_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_r_gsm_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_dcs_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_dcs_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_gsm_850_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_gsm_850_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_pcs_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_pcs_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_gsm_480_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_gsm_480_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_gsm_450_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_gsm_450_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_set_en_cc_dtmf_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_set_di_cc_dtmf_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_sms_ptp_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_sms_ptp_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_1_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_1_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_2_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_2_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_4_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_4_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_5_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_5_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_6_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_6_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_a5_7_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_a5_7_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_p_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_p_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_e_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_e_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_r_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_r_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_er_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_er_gsm_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_dcs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_dcs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_gsm_850_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_gsm_850_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_pcs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_pcs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_gsm_480_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_gsm_480_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_gsm_450_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_gsm_450_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_class_900_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_class_dcs_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_class_850_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_class_pcs_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_class_400_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_ch_cap_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_full_v1_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_full_v1_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_full_v2_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_full_v2_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_full_v3_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_full_v3_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_half_v1_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_half_v1_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_half_v3_cmd);
-	install_element(SUPPORT_NODE, &cfg_ms_sup_no_half_v3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_full_v1_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_full_v1_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_full_v2_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_full_v2_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_full_v3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_full_v3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_half_v1_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_half_v1_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_half_v3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_half_v3_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_csd_tch_f144_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_csd_tch_f144_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_csd_tch_f96_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_csd_tch_f96_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_csd_tch_f48_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_csd_tch_f48_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_csd_tch_h48_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_csd_tch_h48_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_csd_tch_f24_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_csd_tch_f24_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_csd_tch_h24_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_csd_tch_h24_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_min_rxlev_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_dsc_max_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_skip_max_per_band_cmd);
 	install_element(SUPPORT_NODE, &cfg_ms_sup_no_skip_max_per_band_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_vgcs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_vgcs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_en_vbs_cmd);
+	install_element(SUPPORT_NODE, &cfg_ms_sup_di_vbs_cmd);
 	install_element(MS_NODE, &cfg_ms_script_load_run_cmd);
 	install_element(MS_NODE, &cfg_ms_no_script_load_run_cmd);
 
-	install_node(&audio_node, config_write_dummy);
-	install_element(AUDIO_NODE, &cfg_ms_audio_io_handler_cmd);
-	install_element(AUDIO_NODE, &cfg_ms_audio_no_io_handler_cmd);
-	install_element(AUDIO_NODE, &cfg_ms_audio_io_tch_format_cmd);
-	install_element(AUDIO_NODE, &cfg_ms_audio_alsa_out_dev_cmd);
-	install_element(AUDIO_NODE, &cfg_ms_audio_alsa_in_dev_cmd);
+	install_node(&tch_voice_node, config_write_dummy);
+	install_element(TCH_VOICE_NODE, &cfg_ms_tch_voice_io_handler_cmd);
+	install_element(TCH_VOICE_NODE, &cfg_ms_tch_voice_no_io_handler_cmd);
+	install_element(TCH_VOICE_NODE, &cfg_ms_tch_voice_io_tch_format_cmd);
+	install_element(TCH_VOICE_NODE, &cfg_ms_tch_voice_alsa_out_dev_cmd);
+	install_element(TCH_VOICE_NODE, &cfg_ms_tch_voice_alsa_in_dev_cmd);
+
+	install_node(&tch_data_node, config_write_dummy);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_io_handler_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_no_io_handler_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_io_tch_format_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_unix_sock_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_cp_type_rate_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_cp_ce_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_cp_sync_async_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_cp_async_nr_stop_bits_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_cp_async_nr_data_bits_cmd);
+	install_element(TCH_DATA_NODE, &cfg_ms_tch_data_cp_async_parity_cmd);
 
 	return 0;
 }

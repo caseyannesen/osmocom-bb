@@ -10,6 +10,10 @@
 #define	T200_DCCH_SHARED		2	/* SDCCH shares SAPI 0 and 3 */
 #define	T200_ACCH			2	/* SACCH SAPI 3 */
 
+/* GSM 04.08 RR timers */
+#define GSM_T3128_MS			1, 0	/* Uplink investigation timer. */
+#define GSM_T3130_MS			5, 0	/* Uplink access timeout. */
+
 
 /* GSM 04.07 9.1.2 */
 #define	GSM48_RR_EST_REQ		0x10
@@ -23,6 +27,15 @@
 #define	GSM48_RR_ABORT_REQ		0x60
 #define	GSM48_RR_ABORT_IND		0x62
 #define	GSM48_RR_ACT_REQ		0x70
+/* These are non-stadard primitives, used for group receive/transmit modes. */
+#define	GSM48_RR_GROUP_REQ		0x80	/* Join a group channel in group receive mode. */
+#define	GSM48_RR_GROUP_CNF		0x81	/* Group channel has been joined. */
+#define	GSM48_RR_GROUP_REL_REQ		0x84	/* Release group channel. */
+#define	GSM48_RR_GROUP_REL_IND		0x86	/* Group channel has been released or failed. */
+#define	GSM48_RR_UPLINK_REQ		0x90	/* Request uplink for group transmit mode. */
+#define	GSM48_RR_UPLINK_CNF		0x91	/* Access granted. */
+#define	GSM48_RR_UPLINK_REL_REQ		0x94	/* Release uplink for group receive mode. */
+#define	GSM48_RR_UPLINK_REL_IND		0x96	/* Access denied or failed or uplink released. */
 
 #define RR_EST_CAUSE_EMERGENCY		1
 #define RR_EST_CAUSE_REESTAB_TCH_F	2
@@ -45,6 +58,8 @@
 #define RR_REL_CAUSE_EMERGENCY_ONLY	6
 #define RR_REL_CAUSE_LOST_SIGNAL	7
 #define RR_REL_CAUSE_LINK_FAILURE	8
+#define RR_REL_CAUSE_UPLINK_BUSY	9
+#define RR_REL_CAUSE_UPLINK_REJECTED	10
 
 #define RR_SYNC_CAUSE_CIPHERING		1
 
@@ -69,6 +84,13 @@ struct gsm48_rr_hdr {
 #define GSM48_RR_ST_CONN_PEND		1
 #define GSM48_RR_ST_DEDICATED		2
 #define GSM48_RR_ST_REL_PEND		3
+
+/* group states (VGCS) */
+enum gsm48_rr_gstate {
+	GSM48_RR_GST_OFF = 0,
+	GSM48_RR_GST_RECEIVE,
+	GSM48_RR_GST_TRANSMIT,
+};
 
 /* special states for SAPI 3 link */
 #define GSM48_RR_SAPI3ST_IDLE		0
@@ -101,6 +123,7 @@ struct gsm48_rr_cd {
 	uint8_t			start; /* start time available */
 	struct gsm_time		start_tm; /* start time */
 	uint8_t			mode; /* mode of channel */
+	uint8_t			tch_flags; /* E.g. L1CTL_TCH_FLAG_RXONLY */
 	uint8_t			cipher; /* ciphering of channel */
 };
 
@@ -158,7 +181,7 @@ struct gsm48_rrlayer {
 
 	/* cr_hist */
 	uint8_t			cr_ra; /* stores requested ra until confirmed */
-	struct gsm48_cr_hist	cr_hist[3];
+	struct gsm48_cr_hist	cr_hist[5];
 
 	/* V(SD) sequence numbers */
 	uint16_t		v_sd; /* 16 PD 1-bit sequence numbers packed */
@@ -195,6 +218,21 @@ struct gsm48_rrlayer {
 	/* sapi 3 */
 	uint8_t			sapi3_state;
 	uint8_t			sapi3_link_id;
+
+	/* group call */
+	struct {
+		struct llist_head	notif_list;	/* list of received call notifications */
+		enum gsm48_rr_gstate	group_state;	/* extension to RR state for group transmit/receive modes */
+		struct gsm48_rr_cd	cd_group;	/* channel description of group call channel */
+		bool			uplink_free;	/* Is set, if uplink is currently free. */
+		uint8_t			uic;		/* UIC to use for access burst (-1 for BSIC) */
+		bool			uplink_access;	/* The network wants us to send listener access bursts. */
+		struct osmo_timer_list	t_ul_free;	/* Uplink free timer. (480ms timer) */
+		struct osmo_timer_list	t3128;		/* Uplink investigation timer. */
+		struct osmo_timer_list	t3130;		/* Uplink access timer. */
+		uint8_t			uplink_tries;	/* Counts number of tries to access the uplink. */
+		uint8_t			uplink_counter;	/* Counts number of access bursts per 'try'. */
+	} vgcs;
 };
 
 const char *get_rr_name(int value);
@@ -213,7 +251,7 @@ extern const char *gsm48_rr_state_names[];
 int gsm48_rr_start_monitor(struct osmocom_ms *ms);
 int gsm48_rr_stop_monitor(struct osmocom_ms *ms);
 int gsm48_rr_alter_delay(struct osmocom_ms *ms);
-int gsm48_rr_tx_voice(struct osmocom_ms *ms, struct msgb *msg);
+int gsm48_rr_tx_traffic(struct osmocom_ms *ms, struct msgb *msg);
 int gsm48_rr_audio_mode(struct osmocom_ms *ms, uint8_t mode);
 
 #endif /* _GSM48_RR_H */

@@ -27,7 +27,6 @@ struct gsm_trans {
 
 	union {
 		struct {
-
 			/* current call state */
 			int state;
 
@@ -39,6 +38,7 @@ struct gsm_trans {
 			int T308_second;	/* used to send release again */
 			struct osmo_timer_list timer;
 			struct gsm_mncc msg;	/* stores setup/disconnect/release message */
+			struct gsm_mncc_bearer_cap *bcap;
 		} cc;
 		struct {
 			/* current supp.serv. state */
@@ -55,6 +55,26 @@ struct gsm_trans {
 
 			struct gsm_sms *sms;
 		} sms;
+		struct {
+			/* VGCS/VBS state machine */
+			struct osmo_fsm_inst *fi;
+
+			/* Call State (See Table 9.3 of TS 144.068) */
+			uint8_t call_state;
+
+			/* State attributes (See Table 9.7 of TS 144.068) */
+			uint8_t d_att, u_att, comm, orig;
+
+			/* Channel description last received via notification */
+			bool ch_desc_present;
+			struct gsm48_chan_desc ch_desc;
+
+			/* Flag to store termination request from upper layer. */
+			bool termination;
+
+			/* Flag to tell the state machine that call changes from separate link to group receive mode. */
+			bool receive_after_sl;
+		} gcc;
 	};
 };
 
@@ -62,7 +82,7 @@ struct gsm_trans {
 
 struct gsm_trans *trans_find_by_id(struct osmocom_ms *ms,
 				   uint8_t proto, uint8_t trans_id);
-struct gsm_trans *trans_find_by_callref(struct osmocom_ms *ms,
+struct gsm_trans *trans_find_by_callref(struct osmocom_ms *ms, uint8_t protocol,
 					uint32_t callref);
 
 struct gsm_trans *trans_alloc(struct osmocom_ms *ms,

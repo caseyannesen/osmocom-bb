@@ -36,7 +36,7 @@
 #include <osmocom/bb/common/ms.h>
 #include <osmocom/bb/common/logging.h>
 
-#include <osmocom/bb/mobile/voice.h>
+#include <osmocom/bb/mobile/tch.h>
 #include <osmocom/bb/mobile/gapk_io.h>
 
 /* The RAW PCM format is common for both audio source and sink */
@@ -57,6 +57,10 @@ static int pq_queue_tch_fb_recv(void *_state, uint8_t *out,
 
 	/* Calculate received frame length */
 	frame_len = msgb_l3len(tch_msg);
+	if (frame_len == 0) {
+		msgb_free(tch_msg);
+		return -EIO;
+	}
 
 	/* Copy the frame bytes from message */
 	memcpy(out, tch_msg->l3h, frame_len);
@@ -100,7 +104,7 @@ static int pq_queue_tch_fb_send(void *_state, uint8_t *out,
  * outgoing frames to UL buffer...
  */
 static int pq_queue_tch_fb(struct osmo_gapk_pq *pq,
-			   struct gapk_io_state *io_state,
+			   struct gapk_io_state *state,
 			   bool is_src)
 {
 	struct osmo_gapk_pq_item *item;
@@ -120,13 +124,13 @@ static int pq_queue_tch_fb(struct osmo_gapk_pq *pq,
 	item->sub_name = "tch_fb";
 
 	/* I/O length */
-	frame_len = io_state->phy_fmt_desc->frame_len;
+	frame_len = state->phy_fmt_desc->frame_len;
 	item->len_in  = is_src ? 0 : frame_len;
 	item->len_out = is_src ? frame_len : 0;
 
 	/* Handler and it's state */
 	item->proc = is_src ? &pq_queue_tch_fb_recv : &pq_queue_tch_fb_send;
-	item->state = io_state;
+	item->state = state;
 
 	return 0;
 }
@@ -163,7 +167,7 @@ static int pq_queue_codec_fmt_conv(struct osmo_gapk_pq *pq,
  * convert an encoder specific format
  * to a PHY specific format.
  */
-static int prepare_audio_source(struct gapk_io_state *gapk_io,
+static int prepare_audio_source(struct gapk_io_state *state,
 				const char *alsa_input_dev)
 {
 	struct osmo_gapk_pq *pq;
@@ -183,22 +187,22 @@ static int prepare_audio_source(struct gapk_io_state *gapk_io,
 		goto error;
 
 	/* Frame encoder */
-	rc = osmo_gapk_pq_queue_codec(pq, gapk_io->codec_desc, 1);
+	rc = osmo_gapk_pq_queue_codec(pq, state->codec_desc, 1);
 	if (rc)
 		goto error;
 
 	/* Encoder specific format -> canonical */
-	rc = pq_queue_codec_fmt_conv(pq, gapk_io->codec_desc, true);
+	rc = pq_queue_codec_fmt_conv(pq, state->codec_desc, true);
 	if (rc)
 		goto error;
 
 	/* Canonical -> PHY specific format */
-	rc = osmo_gapk_pq_queue_fmt_convert(pq, gapk_io->phy_fmt_desc, 1);
+	rc = osmo_gapk_pq_queue_fmt_convert(pq, state->phy_fmt_desc, 1);
 	if (rc)
 		goto error;
 
 	/* TCH frame buffer sink */
-	rc = pq_queue_tch_fb(pq, gapk_io, false);
+	rc = pq_queue_tch_fb(pq, state, false);
 	if (rc)
 		goto error;
 
@@ -213,7 +217,7 @@ static int prepare_audio_source(struct gapk_io_state *gapk_io,
 		goto error;
 
 	/* Save pointer within MS GAPK state */
-	gapk_io->pq_source = pq;
+	state->pq_source = pq;
 
 	/* Describe prepared chain */
 	pq_desc = osmo_gapk_pq_describe(pq);
@@ -240,7 +244,7 @@ error:
  * A ECU (Error Concealment Unit) block is optionally
  * added if implemented for a given codec.
  */
-static int prepare_audio_sink(struct gapk_io_state *gapk_io,
+static int prepare_audio_sink(struct gapk_io_state *state,
 			      const char *alsa_output_dev)
 {
 	struct osmo_gapk_pq *pq;
@@ -255,25 +259,25 @@ static int prepare_audio_sink(struct gapk_io_state *gapk_io,
 		return -ENOMEM;
 
 	/* TCH frame buffer source */
-	rc = pq_queue_tch_fb(pq, gapk_io, true);
+	rc = pq_queue_tch_fb(pq, state, true);
 	if (rc)
 		goto error;
 
 	/* PHY specific format -> canonical */
-	rc = osmo_gapk_pq_queue_fmt_convert(pq, gapk_io->phy_fmt_desc, 0);
+	rc = osmo_gapk_pq_queue_fmt_convert(pq, state->phy_fmt_desc, 0);
 	if (rc)
 		goto error;
 
 	/* Optional ECU (Error Concealment Unit) */
-	osmo_gapk_pq_queue_ecu(pq, gapk_io->codec_desc);
+	osmo_gapk_pq_queue_ecu(pq, state->codec_desc);
 
 	/* Canonical -> decoder specific format */
-	rc = pq_queue_codec_fmt_conv(pq, gapk_io->codec_desc, false);
+	rc = pq_queue_codec_fmt_conv(pq, state->codec_desc, false);
 	if (rc)
 		goto error;
 
 	/* Frame decoder */
-	rc = osmo_gapk_pq_queue_codec(pq, gapk_io->codec_desc, 0);
+	rc = osmo_gapk_pq_queue_codec(pq, state->codec_desc, 0);
 	if (rc)
 		goto error;
 
@@ -293,7 +297,7 @@ static int prepare_audio_sink(struct gapk_io_state *gapk_io,
 		goto error;
 
 	/* Save pointer within MS GAPK state */
-	gapk_io->pq_sink = pq;
+	state->pq_sink = pq;
 
 	/* Describe prepared chain */
 	pq_desc = osmo_gapk_pq_describe(pq);
@@ -312,29 +316,26 @@ error:
  * processing queues (chains), and deallocates the memory.
  * Should be called when a voice call is finished...
  */
-int gapk_io_clean_up_ms(struct osmocom_ms *ms)
+void gapk_io_state_free(struct gapk_io_state *state)
 {
 	struct msgb *msg;
 
-	if (ms->gapk_io == NULL)
-		return 0;
+	if (state == NULL)
+		return;
 
 	/* Flush TCH frame I/O buffers */
-	while ((msg = msgb_dequeue(&ms->gapk_io->tch_dl_fb)))
+	while ((msg = msgb_dequeue(&state->tch_dl_fb)))
 		msgb_free(msg);
-	while ((msg = msgb_dequeue(&ms->gapk_io->tch_ul_fb)))
+	while ((msg = msgb_dequeue(&state->tch_ul_fb)))
 		msgb_free(msg);
 
 	/* Destroy both audio I/O chains */
-	if (ms->gapk_io->pq_source)
-		osmo_gapk_pq_destroy(ms->gapk_io->pq_source);
-	if (ms->gapk_io->pq_sink)
-		osmo_gapk_pq_destroy(ms->gapk_io->pq_sink);
+	if (state->pq_source != NULL)
+		osmo_gapk_pq_destroy(state->pq_source);
+	if (state->pq_sink != NULL)
+		osmo_gapk_pq_destroy(state->pq_sink);
 
-	talloc_free(ms->gapk_io);
-	ms->gapk_io = NULL;
-
-	return 0;
+	talloc_free(state);
 }
 
 /**
@@ -382,73 +383,73 @@ static enum osmo_gapk_format_type phy_fmt_pick_ti(enum osmo_gapk_codec_type code
  * and prepares both processing queues (chains).
  * Should be called when a voice call is initiated...
  */
-int gapk_io_init_ms(struct osmocom_ms *ms, enum osmo_gapk_codec_type codec)
+struct gapk_io_state *
+gapk_io_state_alloc(struct osmocom_ms *ms,
+		    enum osmo_gapk_codec_type codec)
 {
 	const struct osmo_gapk_format_desc *phy_fmt_desc;
 	const struct osmo_gapk_codec_desc *codec_desc;
-	struct gsm_settings *set = &ms->settings;
+	const struct gsm_settings *set = &ms->settings;
 	enum osmo_gapk_format_type phy_fmt;
-	struct gapk_io_state *gapk_io;
+	struct gapk_io_state *state;
 	int rc = 0;
 
 	LOGP(DGAPK, LOGL_NOTICE, "Initialize GAPK I/O\n");
-
-	OSMO_ASSERT(ms->gapk_io == NULL);
 
 	/* Make sure that the chosen codec has description */
 	codec_desc = osmo_gapk_codec_get_from_type(codec);
 	if (codec_desc == NULL) {
 		LOGP(DGAPK, LOGL_ERROR, "Invalid codec type 0x%02x\n", codec);
-		return -EINVAL;
+		return NULL;
 	}
 
 	/* Make sure that the chosen codec is supported */
 	if (codec_desc->codec_encode == NULL || codec_desc->codec_decode == NULL) {
 		LOGP(DGAPK, LOGL_ERROR,
 		     "Codec '%s' is not supported by GAPK\n", codec_desc->name);
-		return -ENOTSUP;
+		return NULL;
 	}
 
-	switch (set->audio.io_format) {
-	case AUDIO_IOF_RTP:
+	switch (set->tch_voice.io_format) {
+	case TCH_VOICE_IOF_RTP:
 		phy_fmt = phy_fmt_pick_rtp(codec);
 		break;
-	case AUDIO_IOF_TI:
+	case TCH_VOICE_IOF_TI:
 		phy_fmt = phy_fmt_pick_ti(codec);
 		break;
 	default:
 		LOGP(DGAPK, LOGL_ERROR, "Unhandled I/O format %s\n",
-		     audio_io_format_name(set->audio.io_format));
-		return -ENOTSUP;
+		     tch_voice_io_format_name(set->tch_voice.io_format));
+		return NULL;
 	}
 
 	phy_fmt_desc = osmo_gapk_fmt_get_from_type(phy_fmt);
 	if (phy_fmt_desc == NULL) {
 		LOGP(DGAPK, LOGL_ERROR, "Failed to pick the PHY specific "
 		     "frame format for codec '%s'\n", codec_desc->name);
-		return -EINVAL;
+		return NULL;
 	}
 
-	gapk_io = talloc_zero(ms, struct gapk_io_state);
-	if (gapk_io == NULL) {
+	state = talloc_zero(ms, struct gapk_io_state);
+	if (state == NULL) {
 		LOGP(DGAPK, LOGL_ERROR, "Failed to allocate memory\n");
-		return -ENOMEM;
+		return NULL;
 	}
 
 	/* Init TCH frame I/O buffers */
-	INIT_LLIST_HEAD(&gapk_io->tch_dl_fb);
-	INIT_LLIST_HEAD(&gapk_io->tch_ul_fb);
+	INIT_LLIST_HEAD(&state->tch_dl_fb);
+	INIT_LLIST_HEAD(&state->tch_ul_fb);
 
 	/* Store the codec / format description */
-	gapk_io->codec_desc = codec_desc;
-	gapk_io->phy_fmt_desc = phy_fmt_desc;
+	state->codec_desc = codec_desc;
+	state->phy_fmt_desc = phy_fmt_desc;
 
 	/* Use gapk_io_state as talloc context for both chains */
-	osmo_gapk_set_talloc_ctx(gapk_io);
+	osmo_gapk_set_talloc_ctx(state);
 
 	/* Prepare both source and sink chains */
-	rc |= prepare_audio_source(gapk_io, set->audio.alsa_input_dev);
-	rc |= prepare_audio_sink(gapk_io, set->audio.alsa_output_dev);
+	rc |= prepare_audio_source(state, set->tch_voice.alsa_input_dev);
+	rc |= prepare_audio_sink(state, set->tch_voice.alsa_output_dev);
 
 	/* Fall back to ms instance */
 	osmo_gapk_set_talloc_ctx(ms);
@@ -456,87 +457,53 @@ int gapk_io_init_ms(struct osmocom_ms *ms, enum osmo_gapk_codec_type codec)
 	/* If at lease one chain constructor failed */
 	if (rc) {
 		/* Destroy both audio I/O chains */
-		if (gapk_io->pq_source)
-			osmo_gapk_pq_destroy(gapk_io->pq_source);
-		if (gapk_io->pq_sink)
-			osmo_gapk_pq_destroy(gapk_io->pq_sink);
+		if (state->pq_source)
+			osmo_gapk_pq_destroy(state->pq_source);
+		if (state->pq_sink)
+			osmo_gapk_pq_destroy(state->pq_sink);
 
 		/* Release the memory and return */
-		talloc_free(gapk_io);
+		talloc_free(state);
 
 		LOGP(DGAPK, LOGL_ERROR, "Failed to initialize GAPK I/O\n");
-		return rc;
+		return NULL;
 	}
-
-	/* Init pointers */
-	ms->gapk_io = gapk_io;
 
 	LOGP(DGAPK, LOGL_NOTICE,
 	     "GAPK I/O initialized for MS '%s', codec '%s'\n",
 	     ms->name, codec_desc->name);
 
-	return 0;
+	return state;
 }
 
-/**
- * Wrapper around gapk_io_init_ms(), that maps both
- * given GSM 04.08 channel type (HR/FR) and channel
- * mode to a codec from 'osmo_gapk_codec_type' enum,
- * checks if a mapped codec is supported by GAPK,
- * and finally calls the wrapped function.
- */
-int gapk_io_init_ms_chan(struct osmocom_ms *ms,
-			 uint8_t ch_type, uint8_t ch_mode)
+/* gapk_io_init_ms() wrapper, selecting a codec based on channel mode and rate */
+struct gapk_io_state *
+gapk_io_state_alloc_mode_rate(struct osmocom_ms *ms,
+			      enum gsm48_chan_mode ch_mode,
+			      bool full_rate)
 {
 	enum osmo_gapk_codec_type codec;
 
-	/* Map GSM 04.08 channel mode to GAPK codec type */
 	switch (ch_mode) {
 	case GSM48_CMODE_SPEECH_V1: /* FR or HR */
-		if (ch_type == RSL_CHAN_Bm_ACCHs)
-			codec = CODEC_FR;
-		else
-			codec = CODEC_HR;
+		codec = full_rate ? CODEC_FR : CODEC_HR;
 		break;
-
 	case GSM48_CMODE_SPEECH_EFR:
 		codec = CODEC_EFR;
 		break;
-
 	case GSM48_CMODE_SPEECH_AMR:
 		codec = CODEC_AMR;
 		break;
-
-	/* Signalling or CSD, do nothing */
-	case GSM48_CMODE_DATA_14k5:
-	case GSM48_CMODE_DATA_12k0:
-	case GSM48_CMODE_DATA_6k0:
-	case GSM48_CMODE_DATA_3k6:
-	case GSM48_CMODE_SIGN:
-		return 0;
 	default:
 		LOGP(DGAPK, LOGL_ERROR, "Unhandled channel mode 0x%02x (%s)\n",
 		     ch_mode, get_value_string(gsm48_chan_mode_names, ch_mode));
-		return -EINVAL;
+		return NULL;
 	}
 
-	return gapk_io_init_ms(ms, codec);
+	return gapk_io_state_alloc(ms, codec);
 }
 
-/**
- * Performs basic initialization of GAPK library,
- * setting the talloc root context and a logging category.
- * Should be called during the application initialization...
- */
-void gapk_io_init(void)
-{
-	/* Init logging subsystem */
-	osmo_gapk_log_init(DGAPK);
-
-	/* Make RAWPCM format info easy to access */
-	rawpcm_fmt = osmo_gapk_fmt_get_from_type(FMT_RAWPCM_S16LE);
-}
-
+/* Enqueue a Downlink TCH frame */
 void gapk_io_enqueue_dl(struct gapk_io_state *state, struct msgb *msg)
 {
 	if (state->tch_dl_fb_len >= GAPK_ULDL_QUEUE_LIMIT) {
@@ -547,48 +514,34 @@ void gapk_io_enqueue_dl(struct gapk_io_state *state, struct msgb *msg)
 
 	msgb_enqueue_count(&state->tch_dl_fb, msg,
 			   &state->tch_dl_fb_len);
+
+	/* Decode and play a received DL TCH frame */
+	osmo_gapk_pq_execute(state->pq_sink);
 }
 
-/* Serves both UL/DL TCH frame I/O buffers */
-int gapk_io_serve_ms(struct osmocom_ms *ms)
+/* Dequeue an Uplink TCH frame */
+void gapk_io_dequeue_ul(struct osmocom_ms *ms, struct gapk_io_state *state)
 {
-	struct gapk_io_state *gapk_io = ms->gapk_io;
-	int work = 0;
+	struct msgb *msg;
 
-	/**
-	 * Make sure we have at least two DL frames
-	 * to prevent discontinuous playback.
-	 */
-	if (gapk_io->tch_dl_fb_len < 2)
-		return 0;
+	/* Record and encode an UL TCH frame */
+	osmo_gapk_pq_execute(state->pq_source);
 
-	/**
-	 * TODO: if there is an active call, but no TCH frames
-	 * in DL buffer, put silence frames using the upcoming
-	 * ECU (Error Concealment Unit) of libosmocodec.
-	 */
-	while (!llist_empty(&gapk_io->tch_dl_fb)) {
-		/* Decode and play a received DL TCH frame */
-		osmo_gapk_pq_execute(gapk_io->pq_sink);
+	/* Obtain one TCH frame from the UL buffer */
+	msg = msgb_dequeue_count(&state->tch_ul_fb, &state->tch_ul_fb_len);
+	if (msg != NULL)
+		tch_send_msg(ms, msg);
+}
 
-		/* Record and encode an UL TCH frame back */
-		osmo_gapk_pq_execute(gapk_io->pq_source);
+/**
+ * Performs basic initialization of GAPK library,
+ * setting the talloc root context and a logging category.
+ */
+static __attribute__((constructor)) void gapk_io_init(void)
+{
+	/* Init logging subsystem */
+	osmo_gapk_log_init(DGAPK);
 
-		work |= 1;
-	}
-
-	while (!llist_empty(&gapk_io->tch_ul_fb)) {
-		struct msgb *tch_msg;
-
-		/* Obtain one TCH frame from the UL buffer */
-		tch_msg = msgb_dequeue_count(&gapk_io->tch_ul_fb,
-					     &gapk_io->tch_ul_fb_len);
-
-		/* Push a voice frame to the lower layers */
-		gsm_send_voice_msg(ms, tch_msg);
-
-		work |= 1;
-	}
-
-	return work;
+	/* Make RAWPCM format info easy to access */
+	rawpcm_fmt = osmo_gapk_fmt_get_from_type(FMT_RAWPCM_S16LE);
 }

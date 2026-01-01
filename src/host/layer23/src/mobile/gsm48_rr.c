@@ -34,6 +34,53 @@
  * When the assignment or handover fails, the old channel is activate and the
  * link is established again. Also pending messages are sent.
  *
+ * Group Channel:
+ *
+ * A group receive/transmit mode is not documented at GSM 04.07. The group
+ * receive mode is similar to the IDLE mode, except that the MS is listening
+ * to a TCH. The group transmit mode is similar to the DEDICATED mode. Special
+ * (undocumented) commands are used to enter group receive and transmit mode.
+ *
+ * There is a substate that indicates group receive/transmit mode. If the
+ * substate is set to group receive, the IDLE mode becomes the group receive
+ * mode. If the substate is set to group transmit, the dedicated mode becomes
+ * the group transmit mode. The substate set to group receive allows to enter
+ * regular dedicated mode and return back to group receive mode afterwards.
+ *
+ * new_rr_state(rr, GSM48_RR_ST_IDLE) is used to return to IDLE mode or to
+ * group receive mode, depending on the substate.
+ *
+ * The Uplink access on group channel:
+ *
+ * If the uplink is busy, wait until it becomes free (Uplink investigation
+ * procedure). Abort, if the procedure times out, if the VGCS UPLINK GRANT
+ * message is recived for a different talker.
+ *
+ * Request uplink using access bursts on TCH until an VGCS UPLINK GRANT is
+ * received. Abort, if it the procedure times out, if the uplink becomes busy,
+ * if the VGCS UPLINK GRANT message references a different frame numer.
+ *
+ * Establish layer 2 with TALKER INDICATION. Abort, if content resolution
+ * mismatches (RR_REL_IND), if link fails (MDL_ERROR), if uplink becomes free.
+ *
+ * Release uplink and wait until uplink becomes free. Abort, if UPLINK RELEASE
+ * is received or if uplink fails.
+ *
+ * New primitives are invented for group/broadcast calls. They are not
+ * specified in any recommendation. They are:
+ *
+ * GSM48_MM_EVENT_NOTIFICATION: Notify MM layer about received/ceased call.
+ * GSM48_MM_EVENT_UPLINK_BUSY: Notify MM layer about uplink becoming busy.
+ * GSM48_MM_EVENT_UPLINK_FREE: Notify MM layer about uplink becoming free.
+ *
+ * RR_GROUP_REQ: The MM layer requests group channel in receive mode.
+ * RR_GROUP_CNF: The RR confirms group channel.
+ * RR_GROUP_REL_REQ: The MM layer releases group channel.
+ * RR_GROUP_REL_IND: The RR indicates/confirms release of group channel.
+ * RR_UPLINK_REQ: The MM layer requests uplink (group transmit mode).
+ * RR_UPLINK_CNF: The RR layer confirms uplink. (Uplink was granted.)
+ * RR_UPLINK_REL_REQ: The MM layer requests release of uplink.
+ * RR_UPLINK_REL_IND: The RR layer indicates/confirms release of uplink
  */
 
 /* Testing delayed (immediate) assignment / handover
@@ -78,22 +125,35 @@
 #include <osmocom/bb/common/utils.h>
 #include <osmocom/bb/common/settings.h>
 
-#include <osmocom/bb/mobile/gapk_io.h>
 #include <osmocom/bb/mobile/vty.h>
 #include <osmocom/bb/mobile/gsm48_rr.h>
 
 #include <l1ctl_proto.h>
 
+/* Check response for the last 3 channel requests only. See TS 44.018 §3.3.1.1.3.1 and §3.3.1.1.3.2. */
+#define IMM_ASS_HISTORY		3
+/* Check response for up to 5 uplink requests. See TS 44.018 §3.3.1.2.1.2. */
+#define UL_GRANT_HISTROY	5
+
+static int gsm48_rr_render_ma(struct osmocom_ms *ms, struct gsm48_rr_cd *cd, uint16_t *ma, uint8_t *ma_len);
+static int gsm48_rr_activate_channel(struct osmocom_ms *ms, struct gsm48_rr_cd *cd, uint16_t *ma, uint8_t ma_len);
 static void start_rr_t_meas(struct gsm48_rrlayer *rr, int sec, int micro);
 static void stop_rr_t_starting(struct gsm48_rrlayer *rr);
 static void stop_rr_t3124(struct gsm48_rrlayer *rr);
 static int gsm48_rcv_rsl(struct osmocom_ms *ms, struct msgb *msg);
 static int gsm48_rr_dl_est(struct osmocom_ms *ms);
 static int gsm48_rr_tx_meas_rep(struct osmocom_ms *ms);
-static int gsm48_rr_set_mode(struct osmocom_ms *ms, uint8_t chan_nr,
-	uint8_t mode);
+static int gsm48_rr_set_mode(struct osmocom_ms *ms, uint8_t chan_nr, uint8_t mode, uint8_t tch_flags);
 static int gsm48_rr_rel_cnf(struct osmocom_ms *ms, struct msgb *msg);
 int gsm414_rcv_test(struct osmocom_ms *ms, const struct msgb *msg);
+static int gsm48_rr_group_rel(struct osmocom_ms *ms, int cause);
+static int gsm48_rr_uplink_access(struct osmocom_ms *ms, struct msgb *msg);
+static int gsm48_rr_uplink_access_abort(struct osmocom_ms *ms, uint8_t cause);
+static int gsm48_rr_uplink_status(struct osmocom_ms *ms, uint32_t event);
+static int gsm48_match_ra(struct osmocom_ms *ms, struct gsm48_req_ref *ref, uint8_t hist_num);
+static int gsm48_rr_tx_talker_indication(struct osmocom_ms *ms);
+static int gsm48_rr_tx_rand_acc_dedicated(struct osmocom_ms *ms, uint8_t ref, uint16_t offset, int8_t uic);
+static int gsm48_rr_uplink_rel_req(struct osmocom_ms *ms, struct msgb *msg);
 
 /*
  * support
@@ -313,6 +373,56 @@ static uint8_t gsm48_rr_check_mode(struct osmocom_ms *ms, uint8_t chan_nr,
 			LOGP(DRR, LOGL_INFO, "Mode: half-rate speech V3\n");
 		}
 		break;
+	case GSM48_CMODE_DATA_14k5:
+		if (ch_type != RSL_CHAN_Bm_ACCHs) {
+			LOGP(DRR, LOGL_ERROR, "TCH/F is expected for mode %s\n",
+			     gsm48_chan_mode_name(mode));
+			return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		} else if (!set->csd_tch_f144) {
+			LOGP(DRR, LOGL_ERROR, "Not supporting TCH/F14.4 data (%s)\n",
+			     gsm48_chan_mode_name(mode));
+			return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		}
+		LOGP(DRR, LOGL_INFO, "Mode: TCH/F14.4 data (%s)\n",
+		     gsm48_chan_mode_name(mode));
+		break;
+	case GSM48_CMODE_DATA_12k0:
+		if (ch_type != RSL_CHAN_Bm_ACCHs) {
+			LOGP(DRR, LOGL_ERROR, "TCH/F is expected for mode %s\n",
+			     gsm48_chan_mode_name(mode));
+			return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		} else if (!set->csd_tch_f96) {
+			LOGP(DRR, LOGL_ERROR, "Not supporting TCH/F9.6 data (%s)\n",
+			     gsm48_chan_mode_name(mode));
+			return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		}
+		LOGP(DRR, LOGL_INFO, "Mode: TCH/F9.6 data (%s)\n",
+		     gsm48_chan_mode_name(mode));
+		break;
+	case GSM48_CMODE_DATA_6k0:
+		if ((ch_type == RSL_CHAN_Bm_ACCHs && !set->csd_tch_f48)
+		 || (ch_type == RSL_CHAN_Lm_ACCHs && !set->csd_tch_h48)) {
+			LOGP(DRR, LOGL_ERROR, "Not supporting TCH/%c4.8 data (%s)\n",
+			     ch_type == RSL_CHAN_Bm_ACCHs ? 'F' : 'H',
+			     gsm48_chan_mode_name(mode));
+			return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		}
+		LOGP(DRR, LOGL_INFO, "Mode: TCH/%c4.8 data (%s)\n",
+		     ch_type == RSL_CHAN_Bm_ACCHs ? 'F' : 'H',
+		     gsm48_chan_mode_name(mode));
+		break;
+	case GSM48_CMODE_DATA_3k6:
+		if ((ch_type == RSL_CHAN_Bm_ACCHs && !set->csd_tch_f24)
+		 || (ch_type == RSL_CHAN_Lm_ACCHs && !set->csd_tch_h24)) {
+			LOGP(DRR, LOGL_ERROR, "Not supporting TCH/%c2.4 data (%s)\n",
+			     ch_type == RSL_CHAN_Bm_ACCHs ? 'F' : 'H',
+			     gsm48_chan_mode_name(mode));
+			return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		}
+		LOGP(DRR, LOGL_INFO, "Mode: TCH/%c2.4 data (%s)\n",
+		     ch_type == RSL_CHAN_Bm_ACCHs ? 'F' : 'H',
+		     gsm48_chan_mode_name(mode));
+		break;
 	default:
 		LOGP(DRR, LOGL_ERROR, "Mode 0x%02x not supported!\n", mode);
 		return GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
@@ -349,19 +459,21 @@ const char *gsm48_rr_state_names[] = {
 
 static void new_rr_state(struct gsm48_rrlayer *rr, int state)
 {
+	struct osmocom_ms *ms = rr->ms;
+
 	if (state < 0 || state >=
 		(sizeof(gsm48_rr_state_names) / sizeof(char *)))
 		return;
 
-	/* must check against equal state */
-	if (rr->state == state) {
+	/* Check against equal state or IDLE state. */
+	if (rr->state == state && state != GSM48_RR_ST_IDLE) {
 		LOGP(DRR, LOGL_INFO, "equal state ? %s\n",
 			gsm48_rr_state_names[rr->state]);
 		return;
 	}
 
 	LOGP(DRR, LOGL_INFO, "new state %s -> %s\n",
-		gsm48_rr_state_names[rr->state], gsm48_rr_state_names[state]);
+	     gsm48_rr_state_names[rr->state], gsm48_rr_state_names[state]);
 
 	/* abort handover, in case of release of dedicated mode */
 	if (rr->state == GSM48_RR_ST_DEDICATED) {
@@ -375,10 +487,15 @@ static void new_rr_state(struct gsm48_rrlayer *rr, int state)
 
 	rr->state = state;
 
-	if (state == GSM48_RR_ST_IDLE) {
+	if (state != GSM48_RR_ST_IDLE)
+		return;
+
+	/* Return from dedicated/group receive/transmit mode to idle mode. (Trigger cell reselection.) */
+	if (rr->vgcs.group_state == GSM48_RR_GST_OFF) {
 		struct msgb *msg, *nmsg;
 		struct gsm322_msg *em;
 
+		LOGP(DRR, LOGL_INFO, "Returning to IDLE mode.\n");
 		/* release dedicated mode, if any */
 		l1ctl_tx_dm_rel_req(rr->ms);
 		rr->ms->meas.rl_fail = 0;
@@ -397,10 +514,6 @@ static void new_rr_state(struct gsm48_rrlayer *rr, int state)
 		memset(&rr->cd_now, 0, sizeof(rr->cd_now));
 		/* reset ciphering */
 		rr->cipher_on = 0;
-#ifdef WITH_GAPK_IO
-		/* clean-up GAPK state */
-		gapk_io_clean_up_ms(rr->ms);
-#endif
 		/* reset audio mode */
 		/* tell cell selection process to return to idle mode
 		 * NOTE: this must be sent unbuffered, because it will
@@ -421,6 +534,41 @@ static void new_rr_state(struct gsm48_rrlayer *rr, int state)
 		msgb_free(nmsg);
 		/* reset any BA range */
 		rr->ba_ranges = 0;
+		return;
+	}
+
+	/* Return from dedicated mode to group receive mode.
+	 * This is not used, because we never enter dedicated mode during group receive/transmit mode.
+	 * It may be used later, if we support it in MM layer. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_RECEIVE) {
+		uint16_t ma[64];
+		uint8_t ma_len;
+		struct msgb *msg;
+
+		LOGP(DRR, LOGL_INFO, "Returning to GROUP RECEIVE mode.\n");
+		/* release dedicated mode, if any */
+		l1ctl_tx_dm_rel_req(rr->ms);
+		rr->ms->meas.rl_fail = 0;
+		rr->dm_est = 0;
+		l1ctl_tx_reset_req(rr->ms, L1CTL_RES_T_SCHED);
+		/* free establish message, if any */
+		rr->rr_est_req = 0;
+		if (rr->rr_est_msg) {
+			msgb_free(rr->rr_est_msg);
+			rr->rr_est_msg = NULL;
+		}
+		/* free all pending messages */
+		while ((msg = msgb_dequeue(&rr->downqueue)))
+			msgb_free(msg);
+		/* reset ciphering */
+		rr->cipher_on = 0;
+		/* copy channel description "group mode" */
+		memcpy(&rr->cd_now, &rr->vgcs.cd_group, sizeof(rr->cd_now));
+		/* render channel "group mode" */
+		gsm48_rr_render_ma(ms, &rr->cd_now, ma, &ma_len);
+		/* activate channel */
+		gsm48_rr_activate_channel(ms, &rr->cd_now, ma, ma_len);
+		return;
 	}
 }
 
@@ -461,6 +609,14 @@ static const struct value_string gsm48_rr_msg_names[] = {
 	{ GSM48_RR_ABORT_REQ,		"RR_ABORT_REQ" },
 	{ GSM48_RR_ABORT_IND,		"RR_ABORT_IND" },
 	{ GSM48_RR_ACT_REQ,		"RR_ACT_REQ" },
+	{ GSM48_RR_GROUP_REQ,		"RR_GROUP_REQ" },
+	{ GSM48_RR_GROUP_CNF,		"RR_GROUP_CNF" },
+	{ GSM48_RR_GROUP_REL_REQ,	"RR_GROUP_REL_REQ" },
+	{ GSM48_RR_GROUP_REL_IND,	"RR_GROUP_REL_IND" },
+	{ GSM48_RR_UPLINK_REQ,		"RR_UPLINK_REQ" },
+	{ GSM48_RR_UPLINK_CNF,		"RR_UPLINK_CNF" },
+	{ GSM48_RR_UPLINK_REL_REQ,	"RR_UPLINK_REL_REQ" },
+	{ GSM48_RR_UPLINK_REL_IND,	"RR_UPLINK_REL_IND" },
 	{ 0,				NULL }
 };
 
@@ -779,6 +935,36 @@ static void timeout_rr_t3126(void *arg)
 	new_rr_state(rr, GSM48_RR_ST_IDLE);
 }
 
+static void timeout_rr_t3128(void *arg)
+{
+	struct gsm48_rrlayer *rr = arg;
+	struct osmocom_ms *ms = rr->ms;
+
+	LOGP(DRR, LOGL_INFO, "timer T3128 has fired\n");
+
+	LOGP(DRR, LOGL_NOTICE, "Failed to access uplink, uplink did not become free.\n");
+	gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_UPLINK_BUSY);
+}
+
+static void timeout_rr_t3130(void *arg)
+{
+	struct gsm48_rrlayer *rr = arg;
+	struct osmocom_ms *ms = rr->ms;
+
+	LOGP(DRR, LOGL_INFO, "timer T3130 has fired\n");
+
+	gsm48_rr_uplink_access(ms, NULL);
+}
+
+static void timeout_rr_t_ul_free(void *arg)
+{
+	struct gsm48_rrlayer *rr = arg;
+
+	LOGP(DRR, LOGL_INFO, "uplink free timer has fired\n");
+	rr->vgcs.uplink_free = false;
+	gsm48_rr_uplink_status(rr->ms, GSM48_MM_EVENT_UPLINK_BUSY);
+}
+
 static void start_rr_t_meas(struct gsm48_rrlayer *rr, int sec, int micro)
 {
 	rr->t_meas.cb = timeout_rr_meas;
@@ -829,6 +1015,33 @@ static void start_rr_t3126(struct gsm48_rrlayer *rr, int sec, int micro)
 	rr->t3126.cb = timeout_rr_t3126;
 	rr->t3126.data = rr;
 	osmo_timer_schedule(&rr->t3126, sec, micro);
+}
+
+static void start_rr_t3128(struct gsm48_rrlayer *rr, int sec, int micro)
+{
+	LOGP(DRR, LOGL_INFO, "starting T3128 with %d.%03d seconds\n", sec,
+		micro / 1000);
+	rr->vgcs.t3128.cb = timeout_rr_t3128;
+	rr->vgcs.t3128.data = rr;
+	osmo_timer_schedule(&rr->vgcs.t3128, sec, micro);
+}
+
+static void start_rr_t3130(struct gsm48_rrlayer *rr, int sec, int micro)
+{
+	LOGP(DRR, LOGL_INFO, "starting T3130 with %d.%03d seconds\n", sec,
+		micro / 1000);
+	rr->vgcs.t3130.cb = timeout_rr_t3130;
+	rr->vgcs.t3130.data = rr;
+	osmo_timer_schedule(&rr->vgcs.t3130, sec, micro);
+}
+
+static void start_rr_t_ul_free(struct gsm48_rrlayer *rr)
+{
+	if (!osmo_timer_pending(&rr->vgcs.t_ul_free))
+		LOGP(DRR, LOGL_INFO, "starting uplink free timer\n");
+	rr->vgcs.t_ul_free.cb = timeout_rr_t_ul_free;
+	rr->vgcs.t_ul_free.data = rr;
+	osmo_timer_schedule(&rr->vgcs.t_ul_free, 0, 480000);
 }
 
 static void stop_rr_t_meas(struct gsm48_rrlayer *rr)
@@ -887,6 +1100,30 @@ static void stop_rr_t3126(struct gsm48_rrlayer *rr)
 	}
 }
 
+static void stop_rr_t3128(struct gsm48_rrlayer *rr)
+{
+	if (osmo_timer_pending(&rr->vgcs.t3128)) {
+		LOGP(DRR, LOGL_INFO, "stopping pending timer T3128\n");
+		osmo_timer_del(&rr->vgcs.t3128);
+	}
+}
+
+static void stop_rr_t3130(struct gsm48_rrlayer *rr)
+{
+	if (osmo_timer_pending(&rr->vgcs.t3130)) {
+		LOGP(DRR, LOGL_INFO, "stopping pending timer T3130\n");
+		osmo_timer_del(&rr->vgcs.t3130);
+	}
+}
+
+static void stop_rr_t_ul_free(struct gsm48_rrlayer *rr)
+{
+	if (osmo_timer_pending(&rr->vgcs.t_ul_free)) {
+		LOGP(DRR, LOGL_INFO, "stopping pending uplink free timer\n");
+		osmo_timer_del(&rr->vgcs.t_ul_free);
+	}
+}
+
 /*
  * status
  */
@@ -922,11 +1159,9 @@ int gsm48_rr_tx_rr_status(struct osmocom_ms *ms, uint8_t cause)
 /* send chiperhing mode complete */
 static int gsm48_rr_tx_cip_mode_cpl(struct osmocom_ms *ms, uint8_t cr)
 {
-	struct gsm_settings *set = &ms->settings;
 	struct msgb *nmsg;
 	struct gsm48_hdr *gh;
 	struct gsm48_rr_hdr *nrrh;
-	uint8_t buf[11], *tlv;
 
 	LOGP(DRR, LOGL_INFO, "CIPHERING MODE COMPLETE (cr %d)\n", cr);
 
@@ -939,13 +1174,8 @@ static int gsm48_rr_tx_cip_mode_cpl(struct osmocom_ms *ms, uint8_t cr)
 	gh->msg_type = GSM48_MT_RR_CIPH_M_COMPL;
 
 	/* MI */
-	if (cr) {
-		gsm48_generate_mid_from_imsi(buf, set->imeisv);
-		/* alter MI type */
-	        buf[2] = (buf[2] & ~GSM_MI_TYPE_MASK) | GSM_MI_TYPE_IMEISV;
-		tlv = msgb_put(nmsg, 2 + buf[1]);
-		memcpy(tlv, buf, 2 + buf[1]);
-	}
+	if (cr)
+		gsm48_encode_mi_tlv(ms, nmsg, GSM_MI_TYPE_IMEISV, false);
 
 	gsm48_send_rsl(ms, RSL_MT_DATA_REQ, nmsg, 0);
 
@@ -1040,10 +1270,11 @@ static int gsm48_rr_enc_cm3(struct osmocom_ms *ms, uint8_t *buf, uint8_t *len)
 	struct gsm_support *sup = &ms->support;
 	struct gsm_settings *set = &ms->settings;
 	struct bitvec bv;
+	int minimum_len;
 
 	memset(&bv, 0, sizeof(bv));
 	bv.data = buf;
-	bv.data_len = 12;
+	bv.data_len = 32;
 
 	/* spare bit */
 	bitvec_set_bit(&bv, 0);
@@ -1053,12 +1284,12 @@ static int gsm48_rr_enc_cm3(struct osmocom_ms *ms, uint8_t *buf, uint8_t *len)
 	else
 		bitvec_set_bit(&bv, ZERO);
 	/* band 2 supported */
-	if (set->e_gsm || set->r_gsm)
+	if (set->e_gsm || set->r_gsm || set->er_gsm)
 		bitvec_set_bit(&bv, ONE);
 	else
 		bitvec_set_bit(&bv, ZERO);
 	/* band 1 supported */
-	if (set->p_gsm && !(set->e_gsm || set->r_gsm))
+	if (set->p_gsm && !(set->e_gsm || set->r_gsm || set->er_gsm))
 		bitvec_set_bit(&bv, ONE);
 	else
 		bitvec_set_bit(&bv, ZERO);
@@ -1080,15 +1311,15 @@ static int gsm48_rr_enc_cm3(struct osmocom_ms *ms, uint8_t *buf, uint8_t *len)
 	else
 		bitvec_set_bit(&bv, ZERO);
 	/* radio capability */
-	if (!set->dcs && !set->p_gsm && !(set->e_gsm || set->r_gsm)) {
-		/* Fig. 10.5.7 / TS 24.0008: none of dcs, p, e, r */
+	if (!set->dcs && !set->p_gsm && !(set->e_gsm || set->r_gsm || set->er_gsm)) {
+		/* Fig. 10.5.7 / TS 24.0008: none of dcs, p, e, (e)r */
 	} else
-	if (set->dcs && !set->p_gsm && !(set->e_gsm || set->r_gsm)) {
+	if (set->dcs && !set->p_gsm && !(set->e_gsm || set->r_gsm || set->er_gsm)) {
 		/* dcs only */
 		bitvec_set_uint(&bv, 0, 4);
 		bitvec_set_uint(&bv, set->class_dcs, 4);
 	} else
-	if (set->dcs && (set->p_gsm || (set->e_gsm || set->r_gsm))) {
+	if (set->dcs && (set->p_gsm || (set->e_gsm || set->r_gsm || set->er_gsm))) {
 		/* dcs */
 		bitvec_set_uint(&bv, set->class_dcs, 4);
 		/* low band */
@@ -1098,8 +1329,10 @@ static int gsm48_rr_enc_cm3(struct osmocom_ms *ms, uint8_t *buf, uint8_t *len)
 		bitvec_set_uint(&bv, 0, 4);
 		bitvec_set_uint(&bv, set->class_900, 4);
 	}
+	/* These octets above shall be included according to GSM 04.08 Version 5.3.0. */
+	minimum_len = (bv.cur_bit + 7) >> 3;
 	/* r support */
-	if (set->r_gsm) {
+	if (set->r_gsm || set->er_gsm) {
 		bitvec_set_bit(&bv, ONE);
 		bitvec_set_uint(&bv, set->class_900, 3);
 	} else {
@@ -1155,7 +1388,7 @@ static int gsm48_rr_enc_cm3(struct osmocom_ms *ms, uint8_t *buf, uint8_t *len)
 	if (set->edge_psk_sup) {
 		bitvec_set_bit(&bv, ONE);
 		bitvec_set_bit(&bv, set->edge_psk_uplink == 1);
-		if (set->p_gsm || (set->e_gsm || set->r_gsm)) {
+		if (set->p_gsm || (set->e_gsm || set->r_gsm || set->er_gsm)) {
 			bitvec_set_bit(&bv, ONE);
 			bitvec_set_uint(&bv, set->class_900_edge, 2);
 		} else {
@@ -1206,11 +1439,98 @@ static int gsm48_rr_enc_cm3(struct osmocom_ms *ms, uint8_t *buf, uint8_t *len)
 	} else {
 		bitvec_set_bit(&bv, ZERO);
 	}
-	/* info: The max number of bits are about 80. */
+	// TODO: Add setting for the following features
+	/* Single Band Support */
+	bitvec_set_bit(&bv, ZERO);
+	/* GSM 750 Band */
+	bitvec_set_bit(&bv, ZERO);
+	/* UMTS  1.28 Mcps */
+	bitvec_set_bit(&bv, ZERO);
+	/* Gerand Feature Package 1 */
+	bitvec_set_bit(&bv, ZERO);
+	/* Extendet DTM GPRS Multi Slot Class */
+	bitvec_set_bit(&bv, ZERO);
+	/* High Multislot Capability */
+	bitvec_set_bit(&bv, ZERO);
+	/* 0 */
+	bitvec_set_bit(&bv, ZERO);
+	/* Gerand Feature Package 1 */
+	bitvec_set_bit(&bv, ZERO);
+	/* GMSK Multislot Power Profile */
+	bitvec_set_uint(&bv, 0, 2);
+	/* 8-PSK Multislot Power Profile */
+	bitvec_set_uint(&bv, 0, 2);
+	/* T-GSM 400 Bands */
+	bitvec_set_bit(&bv, ZERO);
+	/* 0 */
+	bitvec_set_bit(&bv, ZERO);
+	/* Downlink Advanced Receiver Performance */
+	bitvec_set_uint(&bv, 0, 2);
+	/* DTM Enancements Capability */
+	bitvec_set_bit(&bv, ZERO);
+	/* DTM GPRS High Multi Slot Class */
+	bitvec_set_bit(&bv, ZERO);
+	/* Repeated ACCH Capability */
+	bitvec_set_bit(&bv, ZERO);
+	/* GSM 710 Associated Radio Capability */
+	bitvec_set_bit(&bv, ZERO);
+	/* T-GSM 810 Associated Radio Capability */
+	bitvec_set_bit(&bv, ZERO);
+	/* Ciphering Mode Setting Capability */
+	bitvec_set_bit(&bv, ZERO);
+	/* Additional Positioning Capabilities */
+	bitvec_set_bit(&bv, ZERO);
+	/* E-UTRAN FDD supported */
+	bitvec_set_bit(&bv, ZERO);
+	/* E-UTRAN TDD supported */
+	bitvec_set_bit(&bv, ZERO);
+	/* E-UTRAN Measurement and Reporting supported */
+	bitvec_set_bit(&bv, ZERO);
+	/* Priorify-based reselection supported */
+	bitvec_set_bit(&bv, ZERO);
+	/* UTRA CSG Cell Reporting */
+	bitvec_set_bit(&bv, ZERO);
+	/* VAMOS Level */
+	bitvec_set_uint(&bv, 0, 2);
+	/* TIGHTER Capability */
+	bitvec_set_uint(&bv, 0, 2);
+	/* Selective Ciphering of Downlink SACCH */
+	bitvec_set_bit(&bv, ZERO);
+	/* CS to PS SRVCC from GERAN to UTRA */
+	bitvec_set_uint(&bv, 0, 2);
+	/* CS to PS SRVCC from GERAN to E-UTRA */
+	bitvec_set_uint(&bv, 0, 2);
+	/* GERAN Network Sharing support */
+	bitvec_set_bit(&bv, ZERO);
+	/* E-UTRA Wideband RSRQ measurements support */
+	bitvec_set_bit(&bv, ZERO);
+	/* GSM ER Band */
+	if (set->er_gsm)
+		bitvec_set_bit(&bv, ONE);
+	else
+		bitvec_set_bit(&bv, ZERO);
+	/* UTRA Multiple Frequency Band indicators support */
+	bitvec_set_bit(&bv, ZERO);
+	/* E-UTRA Multiple Frequency Band indicators support */
+	bitvec_set_bit(&bv, ZERO);
+	/* Extended TSC Set Capability support */
+	bitvec_set_bit(&bv, ZERO);
+	/* Extended EARFCN value rande */
+	bitvec_set_bit(&bv, ZERO);
 
 	/* partial bytes will be padded with zero */
 	*len = (bv.cur_bit + 7) >> 3;
 	bitvec_fill(&bv, (*len*8) - bv.cur_bit, ZERO);
+
+	/* Remove all all-zero octets at the end. See the rule in Clause 10.5.7.1:
+	   "Typically, the number of spare bits at the end is the minimum to reach an octet boundary.
+	    The receiver may add any number of bits set to "0" at the end of the received string
+	    if needed for correct decoding."
+	   GSM 04.08 Version 5.3.0 states that spare octets after "octet 3" and "octet 3bis" may be omitted.
+	   Note that "octet 3" refers to the first value (buf[0]) in this TLV information element.
+	 */
+	while (*len > minimum_len && buf[*len - 1] == 0x00)
+		(*len)--;
 
 	return 0;
 }
@@ -1226,7 +1546,7 @@ int gsm48_rr_enc_cm2(struct osmocom_ms *ms, struct gsm48_classmark2 *cm,
 	cm->a5_1 = !set->a5_1;
 	cm->es_ind = sup->es_ind;
 	cm->rev_lev = sup->rev_lev;
-	cm->fc = (set->r_gsm || set->e_gsm);
+	cm->fc = (set->er_gsm || set->r_gsm || set->e_gsm);
 	cm->vgcs = sup->vgcs;
 	cm->vbs = sup->vbs;
 	cm->sm_cap = set->sms_ptp;
@@ -1268,7 +1588,7 @@ static int gsm48_rr_tx_cm_change(struct osmocom_ms *ms)
 	gsm48_rr_enc_cm2(ms, &cc->cm2, rr->cd_now.arfcn);
 
 	/* classmark 3 */
-	if (set->dcs || set->pcs || set->e_gsm || set->r_gsm || set->gsm_850
+	if (set->dcs || set->pcs || set->e_gsm || set->r_gsm || set->er_gsm || set->gsm_850
 	 || set->a5_7 || set->a5_6 || set->a5_5 || set->a5_4
 	 || sup->ms_sup
 	 || sup->ucs2_treat
@@ -1289,6 +1609,648 @@ static int gsm48_rr_rx_cm_enq(struct osmocom_ms *ms, struct msgb *msg)
 {
 	/* send classmark */
 	return gsm48_rr_tx_cm_change(ms);
+}
+
+/*
+ * ASCI notification
+ */
+
+struct asci_notif {
+	struct llist_head	entry;
+	struct gsm48_rrlayer	*rr;
+	uint8_t			gcr[5];
+	bool			ch_desc_present;
+	struct gsm48_chan_desc	ch_desc;
+	struct osmo_timer_list	timer;
+};
+
+/* When does a notification received from NCH expires. */
+#define NOTIFICATION_TIMEOUT	5
+
+static void asci_notif_timeout(void *arg);
+
+/* Add new notification to list. */
+static struct asci_notif *asci_notif_alloc(struct gsm48_rrlayer *rr, const uint8_t *gcr)
+{
+	struct asci_notif *notif;
+
+	notif = talloc_zero(rr->ms, struct asci_notif);
+	if (!notif)
+		return NULL;
+	notif->rr = rr;
+	memcpy(notif->gcr, gcr, sizeof(notif->gcr));
+	llist_add_tail(&notif->entry, &rr->vgcs.notif_list);
+
+	notif->timer.cb = asci_notif_timeout;
+	notif->timer.data = notif;
+
+	return notif;
+}
+
+/* Remove notification from list. */
+static void asci_notif_free(struct asci_notif *notif)
+{
+	osmo_timer_del(&notif->timer);
+	llist_del(&notif->entry);
+	talloc_free(notif);
+}
+
+/* Remove all ASCI notifications from list. */
+static void asci_notif_list_free(struct gsm48_rrlayer *rr)
+{
+	struct asci_notif *notif, *notif2;
+
+	llist_for_each_entry_safe(notif, notif2, &rr->vgcs.notif_list, entry)
+		asci_notif_free(notif);
+}
+
+/* Notification timed out. */
+static void asci_notif_timeout(void *arg)
+{
+	struct asci_notif *notif = arg;
+	struct gsm48_rrlayer *rr = notif->rr;
+	struct msgb *nmsg;
+	struct gsm48_mm_event *mme;
+
+	/* Send notification of ceased call to MM layer. */
+	LOGP(DRR, LOGL_INFO, "Notify MM layer about ceased group call.\n");
+	nmsg = gsm48_mmevent_msgb_alloc(GSM48_MM_EVENT_NOTIFICATION);
+	if (!nmsg)
+		return;
+	mme = (struct gsm48_mm_event *) nmsg->data;
+	memcpy(mme->notification.gcr, notif->gcr, sizeof(mme->notification.gcr));
+	mme->notification.gone = true;
+	gsm48_mmevent_msg(rr->ms, nmsg);
+
+	asci_notif_free(notif);
+}
+
+/* Find notification in list. */
+static struct asci_notif *asci_notif_find(struct gsm48_rrlayer *rr, const uint8_t *gcr)
+{
+	struct asci_notif *notif;
+
+	llist_for_each_entry(notif, &rr->vgcs.notif_list, entry) {
+		if (!memcmp(&notif->gcr, gcr, sizeof(notif->gcr)))
+			return notif;
+	}
+
+	return NULL;
+}
+
+static int gsm48_rr_rx_group_call(struct osmocom_ms *ms, const uint8_t *gcr, const uint8_t *ch_desc, bool nch)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct asci_notif *notif;
+	bool update_call = false;
+	struct msgb *nmsg;
+	struct gsm48_mm_event *mme;
+
+	/* Find or create notification entry. Only create entries for notifications on NCH */
+	notif = asci_notif_find(rr, gcr);
+	if (!notif) {
+		update_call = true;
+		if (nch) {
+			notif = asci_notif_alloc(rr, gcr);
+			if (!notif)
+				return -ENOMEM;
+		}
+	}
+
+	/* Update channel description. */
+	if (notif) {
+		if (ch_desc) {
+			if (!notif->ch_desc_present)
+				update_call = true;
+			notif->ch_desc_present = true;
+			memcpy(&notif->ch_desc, ch_desc, sizeof(notif->ch_desc));
+		} else {
+			notif->ch_desc_present = false;
+			if (!notif->ch_desc_present)
+				update_call = true;
+		}
+		/* (Re-)Start timer. */
+		osmo_timer_schedule(&notif->timer, NOTIFICATION_TIMEOUT, 0);
+	} else
+		update_call = true;
+
+	/* Send notification of new or updated call to MM layer. */
+	if (update_call) {
+		LOGP(DRR, LOGL_INFO, "Notify MM layer about new/updated group call.\n");
+		nmsg = gsm48_mmevent_msgb_alloc(GSM48_MM_EVENT_NOTIFICATION);
+		if (!nmsg)
+			return -ENOMEM;
+		mme = (struct gsm48_mm_event *) nmsg->data;
+		memcpy(mme->notification.gcr, gcr, sizeof(mme->notification.gcr));
+		if (ch_desc) {
+			mme->notification.ch_desc_present = true;
+			memcpy(&mme->notification.ch_desc, ch_desc, sizeof(mme->notification.ch_desc));
+		}
+		gsm48_mmevent_msg(ms, nmsg);
+	}
+
+	return 0;
+}
+
+/* Common function to decode Group Call Information */
+static int gsm48_rr_decode_group_call_info(struct osmocom_ms *ms, struct bitvec *bv, bool nch)
+{
+	struct bitvec *gcr_bv = NULL, *chd_bv = NULL;
+	int rc = 0;
+	int i;
+
+	/* <Group Call Reference : bit(36)> */
+	gcr_bv = bitvec_alloc(OSMO_BYTES_FOR_BITS(36), NULL);
+	OSMO_ASSERT(gcr_bv);
+	for (i = 0; i < 36; i++)
+		bitvec_set_bit(gcr_bv, bitvec_get_bit_pos(bv, bv->cur_bit++));
+	/* Group Channel Description */
+	if (bitvec_get_bit_pos(bv, bv->cur_bit++) == 1) {
+		chd_bv = bitvec_alloc(OSMO_BYTES_FOR_BITS(24), NULL);
+		OSMO_ASSERT(chd_bv);
+		for (i = 0; i < 24; i++)
+			bitvec_set_bit(chd_bv, bitvec_get_bit_pos(bv, bv->cur_bit++));
+		/* FIXME: hopping */
+		if (bitvec_get_bit_pos(bv, bv->cur_bit++) == 1) {
+			LOGP(DRR, LOGL_ERROR, "Hopping not supported on VGCS/VBS channel, please fix!\n");
+			rc = -ENOTSUP;
+			goto out;
+		}
+	}
+
+	rc = gsm48_rr_rx_group_call(ms, gcr_bv->data, (chd_bv) ? chd_bv->data : NULL, nch);
+
+out:
+	bitvec_free(chd_bv);
+	bitvec_free(gcr_bv);
+
+	return rc;
+}
+
+/* Notification/FACCH (9.1.21a) */
+static int gsm48_rr_rx_notif_facch(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_hdr_sh *sgh = msgb_l3(msg);
+	int payload_len = msgb_l3len(msg) - sizeof(*sgh);
+	struct bitvec bv;
+	int rc;
+
+	LOGP(DRR, LOGL_INFO, "NOTIFICATION/FACCH\n");
+
+	bv = (struct bitvec) {
+		.data = sgh->data,
+		.data_len = payload_len,
+	};
+
+	/* Group Call Information */
+	if (bitvec_get_bit_pos(&bv, bv.cur_bit++) == 0) {
+		rc = gsm48_rr_decode_group_call_info(ms, &bv, false);
+		return rc;
+	}
+
+	/* Note: Other information are not used. */
+	return -ENOTSUP;
+}
+
+/* Notification/NCH (9.1.21b) */
+static int gsm48_rr_rx_notif_nch(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_notification_nch *nn = msgb_l3(msg);
+	int payload_len = msgb_l3len(msg) - sizeof(*nn);
+	struct bitvec bv;
+	int rc;
+
+	LOGP(DRR, LOGL_INFO, "NOTIFICATION/NCH\n");
+
+	bv = (struct bitvec) {
+		.data = nn->data,
+		.data_len = payload_len,
+	};
+
+	/* 0 | 1 <NLN(NCH) : bit (2) > */
+	if (bitvec_get_bit_pos(&bv, bv.cur_bit++) == 1) {
+		/* NLN not used
+		nln = bitvec_get_uint(&bv, 2);
+		nln_present = true;
+		*/
+		bv.cur_bit += 2;
+	}
+
+	/* < list of Group Call NCH information > */
+	while (bitvec_get_bit_pos(&bv, bv.cur_bit++) == 1) {
+		rc = gsm48_rr_decode_group_call_info(ms, &bv, true);
+		if (rc < 0)
+			break;
+	}
+
+	return 0;
+}
+
+/*
+ * VGCS uplink control
+ */
+
+/* Send uplink status to upper layer. */
+static int gsm48_rr_uplink_status(struct osmocom_ms *ms, uint32_t event)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct msgb *nmsg;
+
+	if (rr->vgcs.group_state != GSM48_RR_GST_RECEIVE)
+		return -EINVAL;
+
+	/* Send notification of uplink state to MM layer. */
+	LOGP(DRR, LOGL_INFO, "Notify MM layer about uplink state.\n");
+	nmsg = gsm48_mmevent_msgb_alloc(event);
+	if (!nmsg)
+		return -ENOMEM;
+	gsm48_mmevent_msg(rr->ms, nmsg);
+
+	return 0;
+}
+
+/* UPLINK BUSY (9.1.46) */
+static int gsm48_rr_rx_uplink_busy(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+
+	LOGP(DRR, LOGL_INFO, "UPLINK BUSY\n");
+
+	/* Only allow when in some group mode. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_OFF)
+		return 0;
+
+	/* Uplink is busy now. */
+	if (rr->vgcs.uplink_free) {
+		rr->vgcs.uplink_free = false;
+		gsm48_rr_uplink_status(ms, GSM48_MM_EVENT_UPLINK_BUSY);
+	}
+	stop_rr_t_ul_free(rr);
+
+	/* Abort during uplink investigation or access procedure. */
+	if (osmo_timer_pending(&rr->vgcs.t3128) || osmo_timer_pending(&rr->vgcs.t3130)) {
+		LOGP(DRR, LOGL_NOTICE, "Abort uplink access, due to busy uplink.\n");
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_UPLINK_BUSY);
+	}
+
+	return 0;
+}
+
+/* UPLINK FREE (9.1.47) */
+static int gsm48_rr_rx_uplink_free(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct bitvec bv;
+	bool uplink_access = false;
+	uint8_t uic = 0xff;
+	uint8_t *mode;
+
+	bv = (struct bitvec) {
+		.data_len = msgb_l3len(msg),
+		.data = msgb_l3(msg),
+		.cur_bit = 8,
+	};
+
+	/* Uplink Access */
+	if (bitvec_get_bit_high(&bv) == H)
+		uplink_access = true;
+
+	/* UIC */
+	if (bitvec_get_bit_high(&bv) == H)
+		uic = bitvec_get_uint(&bv, 6);
+
+	/* Note: Emergency Indicator not used. */
+
+	/* Do not flood the logging with UPLINK FREE messages. Log only on the fist received message. */
+	if (!osmo_timer_pending(&rr->vgcs.t_ul_free))
+		LOGP(DRR, LOGL_INFO, "UPLINK FREE (uplink access=%s, uic=0x%02x)\n", (uplink_access) ? "true" : "false",
+		     uic);
+
+	/* Uplink is free now. */
+	if (!rr->vgcs.uplink_free) {
+		rr->vgcs.uplink_free = true;
+		gsm48_rr_uplink_status(ms, GSM48_MM_EVENT_UPLINK_FREE);
+	}
+	rr->vgcs.uic = uic;
+	rr->vgcs.uplink_access = uplink_access;
+	start_rr_t_ul_free(rr);
+
+	/* We can be in group mode or in dedicated mode. When we are in dedicated mode and we receive UPLINK FREE,
+	 * we know that we are actually on a group channel. This is the actual confirm to the UPLINK RELEASE message
+	 * on a group channel. We must then release layer 2 locally and indicate channel release toward upper layer.
+	 *
+	 * When we are in group transmit mode, we return to group receive mode and also release layer 2 locally and
+	 * indicate uplink release towards upper layer.
+	 *
+	 * When we are waiting for a free uplink (T3128 is running), we start uplink access. While accessing the
+	 * uplink, we ignore further UPLINK FREE messages.
+	 */
+	if (rr->vgcs.group_state != GSM48_RR_GST_OFF) {
+		/* Start uplink access. */
+		if (osmo_timer_pending(&rr->vgcs.t3128)) {
+			/* Stop timer, because uplink is now free. */
+			stop_rr_t3128(rr);
+			rr->vgcs.uplink_tries = 3;
+			return gsm48_rr_uplink_access(ms, NULL);
+		}
+
+		/* Ignore uplink free messages while accessing uplink. */
+		if (osmo_timer_pending(&rr->vgcs.t3130))
+			return 0;
+	}
+
+	/* Any time in group transmit mode or dedicated mode, release on uplink free. */
+	if (rr->state == GSM48_RR_ST_DEDICATED || rr->state == GSM48_RR_ST_REL_PEND) {
+		struct msgb *nmsg;
+
+		LOGP(DRR, LOGL_INFO, "Uplink becomes free, send (local) release to layer 2.\n");
+
+		/* Go into pending release state if not already.
+		 * We are already in pending relese state when we release uplink normally.
+		 * If we receive UPLINK FREE while we release normally, we abort layer 2. */
+		if (rr->state != GSM48_RR_ST_REL_PEND)
+			new_rr_state(rr, GSM48_RR_ST_REL_PEND);
+
+		/* release message */
+		nmsg = gsm48_l3_msgb_alloc();
+		if (!nmsg)
+			return -ENOMEM;
+		mode = msgb_put(nmsg, 2);
+		mode[0] = RSL_IE_RELEASE_MODE;
+		mode[1] = RSL_REL_LOCAL_END;
+		gsm48_send_rsl_nol3(ms, RSL_MT_REL_REQ, nmsg, 0);
+
+		return 0;
+	}
+
+	return 0;
+}
+
+/* UPLINK RELEASE (9.1.48) */
+static int gsm48_rr_rx_uplink_release(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct gsm48_hdr *gh = msgb_l3(msg);
+	struct gsm48_uplink_release *ur = (struct gsm48_uplink_release *)gh->data;
+	int payload_len = msgb_l3len(msg) - sizeof(*gh) - sizeof(*ur);
+
+	if (payload_len < 0) {
+		LOGP(DRR, LOGL_NOTICE, "Short UPLINK RELEASE message.\n");
+		return -EINVAL;
+	}
+
+	LOGP(DRR, LOGL_INFO, "UPLINK RELEASE with cause 0x%02x\n", ur->rr_cause);
+
+	/* Only allow when in some group mode. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_OFF)
+		return 0;
+
+	if (rr->state == GSM48_RR_ST_DEDICATED && rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT)
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_NORMAL);
+
+	return 0;
+}
+
+/* VGCS UPLINK GRANT (9.1.49) */
+static int gsm48_rr_rx_vgcs_uplink_grant(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct gsm48_sysinfo *s = &ms->cellsel.sel_si;
+	struct gsm_settings *set = &ms->settings;
+	struct gsm0408_vgcs_ul_grant *ug = msgb_l3(msg);
+	int ug_len = msgb_l3len(msg) - sizeof(*ug);
+
+	LOGP(DRR, LOGL_INFO, "VGCS UPLINK GRANT\n");
+
+	if (ug_len < 0) {
+		LOGP(DRR, LOGL_NOTICE, "Short read of VGCS UPLINK GRANT message.\n");
+		return -EINVAL;
+	}
+
+	/* Only allow when in some group mode. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_OFF)
+		return 0;
+
+	/* Uplink is busy now. */
+	if (rr->vgcs.uplink_free) {
+		rr->vgcs.uplink_free = false;
+		gsm48_rr_uplink_status(rr->ms, GSM48_MM_EVENT_UPLINK_BUSY);
+	}
+	stop_rr_t_ul_free(rr);
+
+	/* Abort during uplink investigation or access procedure. */
+	if (osmo_timer_pending(&rr->vgcs.t3128)) {
+		LOGP(DRR, LOGL_NOTICE, "Abort uplink access, other phone accessing the uplink.\n");
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_UPLINK_BUSY);
+	}
+
+	/* We are not waiting for the uplink to be granted. */
+	if (!osmo_timer_pending(&rr->vgcs.t3130))
+		return 0;
+
+	/* Stop timer. */
+	stop_rr_t3130(rr);
+
+	/* Check if message is for our request. */
+	if (!gsm48_match_ra(ms, &ug->req_ref, 5)) {
+		LOGP(DRR, LOGL_NOTICE, "Abort uplink access, other phone gets uplink access granted.\n");
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_UPLINK_BUSY);
+	}
+
+	LOGP(DRR, LOGL_INFO, "Access to uplink has been granted.\n");
+
+	/* Set initial power and timing advance. */
+	rr->cd_now.ind_tx_power = s->ms_txpwr_max_cch;
+	rr->cd_now.ind_ta = ug->ta;
+	LOGP(DRR, LOGL_INFO, "Applying initial ta and tx_power\n");
+	l1ctl_tx_param_req(ms, rr->cd_now.ind_ta - set->alter_delay,
+			   (set->alter_tx_power) ? set->alter_tx_power_value : s->ms_txpwr_max_cch);
+
+	/* Turn on transmitter. */
+	rr->cd_now.tch_flags &= ~(L1CTL_TCH_FLAG_RXONLY);
+	gsm48_rr_set_mode(ms, rr->cd_now.chan_nr, rr->cd_now.mode, rr->cd_now.tch_flags);
+
+	/* Complete group transmit mode. */
+	new_rr_state(rr, GSM48_RR_ST_DEDICATED);
+
+	/* Establish layer 2 connection. */
+	return gsm48_rr_tx_talker_indication(ms);
+}
+
+/* send rr uplink release */
+static int gsm48_rr_tx_uplink_release(struct osmocom_ms *ms, uint8_t cause)
+{
+	struct msgb *nmsg;
+	struct gsm48_hdr *gh;
+	struct gsm48_uplink_release *ur;
+
+	LOGP(DRR, LOGL_INFO, "UPLINK RELEASE (cause #%d)\n", cause);
+
+	nmsg = gsm48_l3_msgb_alloc();
+	if (!nmsg)
+		return -ENOMEM;
+	gh = (struct gsm48_hdr *) msgb_put(nmsg, sizeof(*gh));
+	ur = (struct gsm48_uplink_release *) msgb_put(nmsg, sizeof(*ur));
+
+	gh->proto_discr = GSM48_PDISC_RR;
+	gh->msg_type = GSM48_MT_RR_UPLINK_RELEASE;
+	ur->rr_cause = cause;
+
+	return gsm48_send_rsl(ms, RSL_MT_DATA_REQ, nmsg, 0);
+}
+
+/* Start uplink access procedure. (3.3.1.2.1.2) */
+static int gsm48_rr_uplink_access(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+
+	/* store frame number */
+	if (msg) {
+		struct abis_rsl_cchan_hdr *ch = msgb_l2(msg);
+		struct gsm48_req_ref *ref =
+				(struct gsm48_req_ref *) (ch->data + 1);
+
+		if (msgb_l2len(msg) < sizeof(*ch) + sizeof(*ref)) {
+			LOGP(DRR, LOGL_ERROR, "CHAN_CNF too slort\n");
+			return -EINVAL;
+		}
+
+		/* Store to history buffer. */
+		/* shift history and store */
+		memcpy(&(rr->cr_hist[4]), &(rr->cr_hist[3]),
+			sizeof(struct gsm48_cr_hist));
+		memcpy(&(rr->cr_hist[3]), &(rr->cr_hist[2]),
+			sizeof(struct gsm48_cr_hist));
+		memcpy(&(rr->cr_hist[2]), &(rr->cr_hist[1]),
+			sizeof(struct gsm48_cr_hist));
+		memcpy(&(rr->cr_hist[1]), &(rr->cr_hist[0]),
+			sizeof(struct gsm48_cr_hist));
+		rr->cr_hist[0].valid = 1;
+		rr->cr_hist[0].ref.ra = rr->cr_ra;
+		rr->cr_hist[0].ref.t1 = ref->t1;
+		rr->cr_hist[0].ref.t2 = ref->t2;
+		rr->cr_hist[0].ref.t3_low = ref->t3_low;
+		rr->cr_hist[0].ref.t3_high = ref->t3_high;
+	}
+
+	if (!osmo_timer_pending(&rr->vgcs.t3130)) {
+		uint8_t uplink_ref;
+
+		/* Only try up to 3 times. */
+		if (!rr->vgcs.uplink_tries) {
+			LOGP(DRR, LOGL_NOTICE, "Abort uplink access, due uplink access timeout.\n");
+			return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_LINK_FAILURE);
+		}
+
+		LOGP(DRR, LOGL_INFO, "Trying to access uplink.\n");
+
+		rr->vgcs.uplink_tries--;
+
+		/* See Table 9.1.45.1 */
+		uplink_ref = layer23_random();
+		uplink_ref &= 0x1f;
+		uplink_ref |= 0xc0;
+
+		/* store value, mask and history */
+		rr->cr_ra = uplink_ref;
+		rr->cr_hist[4].valid = 0;
+		rr->cr_hist[3].valid = 0;
+		rr->cr_hist[2].valid = 0;
+		rr->cr_hist[1].valid = 0;
+		rr->cr_hist[0].valid = 0;
+
+		/* Reset counter. */
+		rr->vgcs.uplink_counter = 0;
+
+		/* Start T3130. */
+		start_rr_t3130(rr, GSM_T3130_MS);
+	}
+
+	/* Send random access bursts up to 5 times. */
+	if (rr->vgcs.uplink_counter < 5) {
+		int delay_ms;
+
+		/* The first UPLINK ACCESS message shall be delayed between 0..20ms.
+		 * Subsequent UPLINK ACCESS messages shall be delayed 100ms + 0..20ms. */
+		delay_ms = (layer23_random() & 0xffff) / 3277;
+		if (rr->vgcs.uplink_counter)
+			delay_ms += 100;
+
+		gsm48_rr_tx_rand_acc_dedicated(ms, rr->cr_ra, delay_ms * 26 / 120, rr->vgcs.uic);
+		rr->vgcs.uplink_counter++;
+	}
+
+	return 0;
+}
+
+/* Whenever uplink access is released or failed for some reason. */
+static int gsm48_rr_uplink_access_abort(struct osmocom_ms *ms, uint8_t cause)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct msgb *nmsg;
+	struct gsm48_rr_hdr *nrrh;
+
+	/* Stop group transmit mode timers. */
+	stop_rr_t3128(rr);
+	stop_rr_t3130(rr);
+
+	/* Turn off transmitter. */
+	rr->cd_now.tch_flags |= L1CTL_TCH_FLAG_RXONLY;
+	gsm48_rr_set_mode(ms, rr->cd_now.chan_nr, rr->cd_now.mode, rr->cd_now.tch_flags);
+
+	/* Only return IDLE without changing channel, because we are still in group transmit mode. */
+	new_rr_state(rr, GSM48_RR_ST_IDLE);
+
+	/* Set group state to receive mode. */
+	rr->vgcs.group_state = GSM48_RR_GST_RECEIVE;
+
+	nmsg = gsm48_rr_msgb_alloc(GSM48_RR_UPLINK_REL_IND);
+	if (!nmsg)
+		return -ENOMEM;
+	nrrh = (struct gsm48_rr_hdr *)nmsg->data;
+	nrrh->cause = cause;
+	return gsm48_rr_upmsg(ms, nmsg);
+}
+
+/* send talker indication */
+static int gsm48_rr_tx_talker_indication(struct osmocom_ms *ms)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct gsm_subscriber *subscr = &ms->subscr;
+	struct gsm322_cellsel *cs = &ms->cellsel;
+	struct msgb *nmsg;
+	struct gsm48_hdr *gh;
+	struct gsm48_talker_indication *ti;
+
+	LOGP(DRR, LOGL_INFO, "TALKER INDICATION\n");
+
+	nmsg = gsm48_l3_msgb_alloc();
+	if (!nmsg)
+		return -ENOMEM;
+	gh = (struct gsm48_hdr *) msgb_put(nmsg, sizeof(*gh));
+	ti = (struct gsm48_talker_indication *) msgb_put(nmsg, sizeof(*ti));
+
+	gh->proto_discr = GSM48_PDISC_RR;
+	gh->msg_type = GSM48_MT_RR_TALKER_IND;
+
+	/* classmark 2 */
+	ti->cm2_len = sizeof(ti->cm2);
+	gsm48_rr_enc_cm2(ms, &ti->cm2, rr->cd_now.arfcn);
+
+	/* mobile identity */
+	if (ms->subscr.tmsi != GSM_RESERVED_TMSI && (osmo_lai_cmp(&subscr->lai, &cs->sel_cgi.lai) == 0)) {
+		gsm48_encode_mi_lv(ms, nmsg, GSM_MI_TYPE_TMSI, false);
+		LOGP(DRR, LOGL_INFO, "Sending TALKER INDICATION with TMSI.\n");
+	} else if (subscr->imsi[0]) {
+		gsm48_encode_mi_lv(ms, nmsg, GSM_MI_TYPE_IMSI, false);
+		LOGP(DRR, LOGL_INFO, "Sending TALKER INDICATION with IMSI.\n");
+	} else {
+		gsm48_encode_mi_lv(ms, nmsg, GSM_MI_TYPE_NONE, false);
+		LOGP(DRR, LOGL_INFO, "Sending TALKER INDICATION without TMSI/IMSI.\n");
+	}
+
+	/* start establishmnet */
+	return gsm48_send_rsl(ms, RSL_MT_EST_REQ, nmsg, 0);
 }
 
 /*
@@ -1316,7 +2278,7 @@ static int gsm48_rr_chan_req(struct osmocom_ms *ms, int cause, int paging,
 	 && (!cs->selected || (cs->state != GSM322_C3_CAMPED_NORMALLY
 			    && cs->state != GSM322_C7_CAMPED_ANY_CELL))) {
 		LOGP(DRR, LOGL_INFO, "Paging, but not camping, ignore.\n");
-	 	return -EINVAL;
+		return -EINVAL;
 	}
 
 	/* ignore channel request while not camping on a cell */
@@ -1497,12 +2459,10 @@ rel_ind:
 		return -EINVAL;
 	}
 
-	/* store value, mask and history */
+	/* store value, mask and clear history */
 	rr->chan_req_val = chan_req_val;
 	rr->chan_req_mask = chan_req_mask;
-	rr->cr_hist[2].valid = 0;
-	rr->cr_hist[1].valid = 0;
-	rr->cr_hist[0].valid = 0;
+	memset(rr->cr_hist, 0, sizeof(rr->cr_hist));
 
 	/* store establishment cause, so 'choose cell' selects the last cell
 	 * after location updating */
@@ -1553,10 +2513,7 @@ int gsm48_rr_tx_rand_acc(struct osmocom_ms *ms, struct msgb *msg)
 		}
 
 		/* shift history and store */
-		memcpy(&(rr->cr_hist[2]), &(rr->cr_hist[1]),
-			sizeof(struct gsm48_cr_hist));
-		memcpy(&(rr->cr_hist[1]), &(rr->cr_hist[0]),
-			sizeof(struct gsm48_cr_hist));
+		memmove(rr->cr_hist + 1, rr->cr_hist, sizeof(rr->cr_hist) - sizeof(rr->cr_hist[0]));
 		rr->cr_hist[0].valid = 1;
 		rr->cr_hist[0].ref.ra = rr->cr_ra;
 		rr->cr_hist[0].ref.t1 = ref->t1;
@@ -1724,32 +2681,31 @@ static int gsm48_new_sysinfo(struct osmocom_ms *ms, uint8_t type)
 	 && s->si5
 	 && (!s->nb_ext_ind_si5 || s->si5bis)) {
 		struct gsm48_rr_meas *rrmeas = &ms->rrlayer.meas;
-		int n = 0, i, refer_pcs;
+		int i;
+		bool refer_pcs;
+		int16_t arfcn;
 
 		LOGP(DRR, LOGL_NOTICE, "Complete set of SI5* for BA(%d)\n",
 			s->nb_ba_ind_si5);
 		rrmeas->nc_num = 0;
 		refer_pcs = gsm_refer_pcs(cs->arfcn, s);
 
-		/* collect channels from freq list (1..1023,0) */
-		for (i = 1; i <= 1024; i++) {
-			if ((s->freq[i & 1023].mask & FREQ_TYPE_REP)) {
-				if (n == 32) {
-					LOGP(DRR, LOGL_NOTICE, "SI5* report "
-						"exceeds 32 BCCHs\n");
-					break;
-				}
-				if (refer_pcs && i >= 512 && i <= 810)
-					rrmeas->nc_arfcn[n] = i | ARFCN_PCS;
-				else
-					rrmeas->nc_arfcn[n] = i & 1023;
-				rrmeas->nc_rxlev_dbm[n] = -128;
-				LOGP(DRR, LOGL_NOTICE, "SI5* report arfcn %s\n",
-					gsm_print_arfcn(rrmeas->nc_arfcn[n]));
-				n++;
-			}
+		/* Collect channels from freq list in correct order. */
+		for (i = 0; i < 32; i++) {
+			arfcn = arfcn_from_freq_index(s, i);
+			if (arfcn < 0)
+				break;
+			if (refer_pcs && arfcn >= 512 && arfcn <= 810)
+				rrmeas->nc_arfcn[i] = arfcn | ARFCN_PCS;
+			else
+				rrmeas->nc_arfcn[i] = arfcn;
+			rrmeas->nc_rxlev_dbm[i] = -128;
+			LOGP(DRR, LOGL_NOTICE, "SI5/SI5bis report arfcn %s (index %d)\n",
+			     gsm_print_arfcn(rrmeas->nc_arfcn[i]), i);
 		}
-		rrmeas->nc_num = n;
+		rrmeas->nc_num = i;
+		if (i == 32 && arfcn_from_freq_index(s, i) >= 0)
+			LOGP(DRR, LOGL_NOTICE, "SI5/SI5bis/SI5ter define more than 32 channels.\n");
 	}
 
 	/* send sysinfo event to other layers */
@@ -2083,6 +3039,40 @@ static int gsm48_rr_rx_sysinfo6(struct osmocom_ms *ms, struct msgb *msg)
 	return gsm48_new_sysinfo(ms, si->system_information);
 }
 
+/* Receive "SYSTEM INFORMATION 10" message (9.1.50). */
+static int gsm48_rr_rx_sysinfo_10(struct osmocom_ms *ms, struct msgb *msg)
+{
+	/* NOTE: Short L2 header is included in this structure */
+	struct gsm48_system_information_type_10 *si = msgb_l3(msg);
+	struct gsm48_sysinfo *s = ms->cellsel.si;
+	int payload_len = msgb_l3len(msg) - sizeof(*si);
+
+	if (!s) {
+		LOGP(DRR, LOGL_INFO, "No cell selected, SYSTEM INFORMATION 10 ignored.\n");
+		return -EINVAL;
+	}
+
+	if (payload_len < 20) {
+		LOGP(DRR, LOGL_NOTICE, "Short read of SYSTEM INFORMATION 10 message.\n");
+		return -EINVAL;
+	}
+
+	/* No complete SI5, cannot decode yet. */
+	if (!s->si5 || !(s->si5bis || !s->nb_ext_ind_si5))
+		return 0;
+
+	/* We decode when changed or when SI10 could not decoded, due to missing neighbor cell infos. */
+	if (!memcmp(si, s->si10_msg, OSMO_MIN(msgb_l3len(msg), sizeof(s->si10_msg))) && s->si10)
+		return 0;
+
+	LOGP(DRR, LOGL_INFO, "New SYSTEM INFORMATION 10\n");
+
+	gsm48_decode_sysinfo10(s, si, msgb_l3len(msg));
+
+	/* We cannot call gsm48_new_sysinfo, because it requires regular message types. */
+	return 0;
+}
+
 /* receive "SYSTEM INFORMATION 13" message (9.1.43a) */
 static int gsm48_rr_rx_sysinfo13(struct osmocom_ms *ms, struct msgb *msg)
 {
@@ -2128,43 +3118,37 @@ static int gsm48_rr_chan2cause[4] = {
 };
 
 /* given LV of mobile identity is checked against ms */
-static uint8_t gsm_match_mi(struct osmocom_ms *ms, uint8_t *mi)
+static uint8_t gsm_match_mi(struct osmocom_ms *ms, const uint8_t *mi_lv)
 {
 	struct gsm322_cellsel *cs = &ms->cellsel;
-	char imsi[16];
-	uint32_t tmsi;
-	uint8_t mi_type;
+	struct osmo_mobile_identity mi;
+	char buf[32];
+	int rc;
 
-	if (mi[0] < 1)
-		return 0;
-	mi_type = mi[1] & GSM_MI_TYPE_MASK;
-	switch (mi_type) {
+	rc = osmo_mobile_identity_decode(&mi, mi_lv+1, mi_lv[0], false);
+	if (rc < 0)
+		return rc;
+	osmo_mobile_identity_to_str_buf(buf, sizeof(buf), &mi);
+
+	switch (mi.type) {
 	case GSM_MI_TYPE_TMSI:
-		if (mi[0] < 5)
-			return 0;
-		memcpy(&tmsi, mi+2, 4);
-		if (ms->subscr.tmsi == ntohl(tmsi)
+		if ((ms->subscr.tmsi == mi.tmsi)
 		 && (osmo_lai_cmp(&ms->subscr.lai, &cs->sel_cgi.lai) == 0)) {
-			LOGP(DPAG, LOGL_INFO, " TMSI %08x matches\n",
-				ntohl(tmsi));
-
-			return mi_type;
+			LOGP(DPAG, LOGL_INFO, " %s matches\n", buf);
+			return mi.type;
 		} else
-			LOGP(DPAG, LOGL_INFO, " TMSI %08x (not for us)\n",
-				ntohl(tmsi));
+			LOGP(DPAG, LOGL_INFO, " %s (not for us)\n", buf);
 		break;
 	case GSM_MI_TYPE_IMSI:
-		gsm48_mi_to_string(imsi, sizeof(imsi), mi + 1, mi[0]);
-		if (!strcmp(imsi, ms->subscr.imsi)) {
-			LOGP(DPAG, LOGL_INFO, " IMSI %s matches\n", imsi);
-
-			return mi_type;
+		if (!strcmp(mi.imsi, ms->subscr.imsi)) {
+			LOGP(DPAG, LOGL_INFO, " %s matches\n", buf);
+			return mi.type;
 		} else
-			LOGP(DPAG, LOGL_INFO, " IMSI %s (not for us)\n", imsi);
+			LOGP(DPAG, LOGL_INFO, "  %s (not for us)\n", buf);
 		break;
 	default:
 		LOGP(DPAG, LOGL_NOTICE, "Paging with unsupported MI type %d.\n",
-			mi_type);
+			mi.type);
 	}
 
 	return 0;
@@ -2372,23 +3356,22 @@ static int gsm48_rr_rx_pag_req_3(struct osmocom_ms *ms, struct msgb *msg)
  */
 
 /* match request reference against request history */
-static int gsm48_match_ra(struct osmocom_ms *ms, struct gsm48_req_ref *ref)
+static int gsm48_match_ra(struct osmocom_ms *ms, struct gsm48_req_ref *ref, uint8_t hist_num)
 {
 	struct gsm48_rrlayer *rr = &ms->rrlayer;
 	int i;
 	uint8_t ia_t1, ia_t2, ia_t3;
 	uint8_t cr_t1, cr_t2, cr_t3;
 
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < hist_num; i++) {
 		/* filter confirmed RACH requests only */
 		if (rr->cr_hist[i].valid && ref->ra == rr->cr_hist[i].ref.ra) {
-		 	ia_t1 = ref->t1;
-		 	ia_t2 = ref->t2;
-		 	ia_t3 = (ref->t3_high << 3) | ref->t3_low;
-			ref = &rr->cr_hist[i].ref;
-		 	cr_t1 = ref->t1;
-		 	cr_t2 = ref->t2;
-		 	cr_t3 = (ref->t3_high << 3) | ref->t3_low;
+			ia_t1 = ref->t1;
+			ia_t2 = ref->t2;
+			ia_t3 = (ref->t3_high << 3) | ref->t3_low;
+			cr_t1 = rr->cr_hist[i].ref.t1;
+			cr_t2 = rr->cr_hist[i].ref.t2;
+			cr_t3 = (rr->cr_hist[i].ref.t3_high << 3) | rr->cr_hist[i].ref.t3_low;
 			if (ia_t1 == cr_t1 && ia_t2 == cr_t2
 			 && ia_t3 == cr_t3) {
 		 		LOGP(DRR, LOGL_INFO, "request %02x matches "
@@ -2478,8 +3461,7 @@ static int gsm48_rr_rx_imm_ass(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cd.h = 0;
 		gsm48_decode_chan_h0(&ia->chan_desc, &cd.tsc, &cd.arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cd.arfcn |= ARFCN_PCS;
+		cd.arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cd.arfcn);
 		LOGP(DRR, LOGL_INFO, " (ta %d/%dm ra 0x%02x chan_nr 0x%02x "
 			"ARFCN %s TS %u SS %u TSC %u)\n",
 			ia->timing_advance,
@@ -2500,7 +3482,7 @@ static int gsm48_rr_rx_imm_ass(struct osmocom_ms *ms, struct msgb *msg)
 	}
 
 	/* request ref */
-	if (gsm48_match_ra(ms, &ia->req_ref)) {
+	if (gsm48_match_ra(ms, &ia->req_ref, IMM_ASS_HISTORY)) {
 		/* channel description */
 		memcpy(&rr->cd_now, &cd, sizeof(rr->cd_now));
 		/* timing advance */
@@ -2597,8 +3579,7 @@ static int gsm48_rr_rx_imm_ass_ext(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cd1.h = 0;
 		gsm48_decode_chan_h0(&ia->chan_desc1, &cd1.tsc, &cd1.arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cd1.arfcn |= ARFCN_PCS;
+		cd1.arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cd1.arfcn);
 		LOGP(DRR, LOGL_INFO, " assignment 1 (ta %d/%dm ra 0x%02x "
 			"chan_nr 0x%02x ARFCN %s TS %u SS %u TSC %u)\n",
 			ia->timing_advance1,
@@ -2626,8 +3607,7 @@ static int gsm48_rr_rx_imm_ass_ext(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cd2.h = 0;
 		gsm48_decode_chan_h0(&ia->chan_desc2, &cd2.tsc, &cd2.arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cd2.arfcn |= ARFCN_PCS;
+		cd2.arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cd2.arfcn);
 		LOGP(DRR, LOGL_INFO, " assignment 2 (ta %d/%dm ra 0x%02x "
 			"chan_nr 0x%02x ARFCN %s TS %u SS %u TSC %u)\n",
 			ia->timing_advance2,
@@ -2648,7 +3628,7 @@ static int gsm48_rr_rx_imm_ass_ext(struct osmocom_ms *ms, struct msgb *msg)
 	}
 
 	/* request ref 1 */
-	if (gsm48_match_ra(ms, &ia->req_ref1)) {
+	if (gsm48_match_ra(ms, &ia->req_ref1, IMM_ASS_HISTORY)) {
 		/* channel description */
 		memcpy(&rr->cd_now, &cd1, sizeof(rr->cd_now));
 		/* timing advance */
@@ -2664,7 +3644,7 @@ static int gsm48_rr_rx_imm_ass_ext(struct osmocom_ms *ms, struct msgb *msg)
 		return gsm48_rr_dl_est(ms);
 	}
 	/* request ref 2 */
-	if (gsm48_match_ra(ms, &ia->req_ref2)) {
+	if (gsm48_match_ra(ms, &ia->req_ref2, IMM_ASS_HISTORY)) {
 		/* channel description */
 		memcpy(&rr->cd_now, &cd2, sizeof(rr->cd_now));
 		/* timing advance */
@@ -2714,7 +3694,7 @@ static int gsm48_rr_rx_imm_ass_rej(struct osmocom_ms *ms, struct msgb *msg)
 				(((uint8_t *)&ia->req_ref1) + i * 4);
 		LOGP(DRR, LOGL_INFO, "IMMEDIATE ASSIGNMENT REJECT "
 			"(ref 0x%02x)\n", req_ref->ra);
-		if (gsm48_match_ra(ms, req_ref)) {
+		if (gsm48_match_ra(ms, req_ref, IMM_ASS_HISTORY)) {
 			/* wait indication */
 			t3122_value = *(((uint8_t *)&ia->wait_ind1) + i * 4);
 			if (t3122_value)
@@ -2743,12 +3723,13 @@ static int gsm48_rr_rx_add_ass(struct osmocom_ms *ms, struct msgb *msg)
 	struct tlv_parsed tp;
 
 	if (payload_len < 0) {
-		LOGP(DRR, LOGL_NOTICE, "Short read of ADDITIONAL ASSIGNMENT "
-			"message.\n");
-		return gsm48_rr_tx_rr_status(ms,
-			GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+		LOGP(DRR, LOGL_NOTICE, "Short read of ADDITIONAL ASSIGNMENT message\n");
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
 	}
-	tlv_parse(&tp, &gsm48_rr_att_tlvdef, aa->data, payload_len, 0, 0);
+	if (tlv_parse(&tp, &gsm48_rr_att_tlvdef, aa->data, payload_len, 0, 0) < 0) {
+		LOGP(DRR, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+	}
 
 	return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
 }
@@ -2802,7 +3783,7 @@ static int gsm48_rr_tx_meas_rep(struct osmocom_ms *ms)
 	if (rep_valid) {
 		int8_t strongest, current;
 		uint8_t ncc;
-		int i, index;
+		int i, index, strongest_i;
 
 #if 0
 		/* FIXME: multi-band reporting, if not: 0 = normal reporting */
@@ -2812,17 +3793,25 @@ static int gsm48_rr_tx_meas_rep(struct osmocom_ms *ms)
 
 		/* get 6 strongest measurements */
 		strongest = 127; /* infinite */
+		strongest_i = -1; /* make gcc happy */
 		for (n = 0; n < 6; n++) {
 			current = -128; /* -infinite */
 			index = 0;
 			for (i = 0; i < rrmeas->nc_num; i++) {
+				/* Skip stronger cells that have been added to measurement report so far. */
+				if (rrmeas->nc_rxlev_dbm[i] > strongest)
+					continue;
+				/* Skip cells with equal strength that have been added so far. */
+				if (rrmeas->nc_rxlev_dbm[i] == strongest && i <= strongest_i)
+					continue;
 				/* only check if NCC is permitted */
 				ncc = rrmeas->nc_bsic[i] >> 3;
 				if ((s->nb_ncc_permitted_si6 & (1 << ncc))
-				 && rrmeas->nc_rxlev_dbm[i] > current
-				 && rrmeas->nc_rxlev_dbm[i] < strongest) {
+				 && rrmeas->nc_rxlev_dbm[i] > current) {
 					current = rrmeas->nc_rxlev_dbm[i];
+					strongest = current;
 					index = i;
+					strongest_i = i;
 				}
 			}
 			if (current == -128) /* no more found */
@@ -2926,6 +3915,9 @@ int gsm48_rr_los(struct osmocom_ms *ms)
 	struct gsm48_rr_hdr *nrrh;
 
 	LOGP(DSUM, LOGL_INFO, "Radio link lost signal\n");
+
+	if (rr->vgcs.group_state != GSM48_RR_GST_OFF)
+		return gsm48_rr_group_rel(ms, RR_REL_CAUSE_LOST_SIGNAL);
 
 	/* stop T3211 if running */
 	stop_rr_t3110(rr);
@@ -3031,7 +4023,7 @@ static int gsm48_rr_activate_channel(struct osmocom_ms *ms,
 	gsm48_rr_tx_meas_rep(ms);
 
 	/* establish */
-	LOGP(DRR, LOGL_INFO, "establishing channel in dedicated mode\n");
+	LOGP(DRR, LOGL_INFO, "establishing channel in dedicated/group mode\n");
 
 	if (rsl_dec_chan_nr(cd->chan_nr, &ch_type, &ch_subch, &ch_ts) != 0) {
 		LOGP(DRR, LOGL_ERROR,
@@ -3040,16 +4032,13 @@ static int gsm48_rr_activate_channel(struct osmocom_ms *ms,
 		return -EINVAL;
 	}
 
-	LOGP(DRR, LOGL_INFO, " Channel type %d, subch %d, ts %d, mode %d, "
-		"audio-mode %d, cipher %d\n", ch_type, ch_subch, ch_ts,
-		cd->mode, rr->audio_mode, rr->cipher_type + 1);
+	LOGP(DRR, LOGL_INFO, " Channel type %d, subch %d, ts %d, mode %d, audio-mode %d, flags 0x%02x, cipher %d\n",
+	     ch_type, ch_subch, ch_ts, cd->mode, rr->audio_mode, cd->tch_flags, rr->cipher_type + 1);
 	if (cd->h)
-		l1ctl_tx_dm_est_req_h1(ms, cd->maio, cd->hsn,
-			ma, ma_len, cd->chan_nr, cd->tsc, cd->mode,
-			rr->audio_mode);
+		l1ctl_tx_dm_est_req_h1(ms, cd->maio, cd->hsn, ma, ma_len, cd->chan_nr, cd->tsc, cd->mode,
+				       rr->audio_mode, cd->tch_flags);
 	else
-		l1ctl_tx_dm_est_req_h0(ms, cd->arfcn, cd->chan_nr, cd->tsc,
-			cd->mode, rr->audio_mode);
+		l1ctl_tx_dm_est_req_h0(ms, cd->arfcn, cd->chan_nr, cd->tsc, cd->mode, rr->audio_mode, cd->tch_flags);
 	rr->dm_est = 1;
 
 	/* old SI 5/6 are not valid on a new dedicated channel */
@@ -3079,7 +4068,7 @@ static int gsm48_rr_channel_after_time(struct osmocom_ms *ms,
 		l1ctl_tx_crypto_req(ms, rr->cd_now.chan_nr,
 			rr->cipher_type + 1, subscr->key, 8);
 
-	gsm48_rr_set_mode(ms, cd->chan_nr, cd->mode);
+	gsm48_rr_set_mode(ms, cd->chan_nr, cd->mode, cd->tch_flags);
 
 	return 0;
 }
@@ -3091,8 +4080,8 @@ static int gsm48_rr_render_ma(struct osmocom_ms *ms, struct gsm48_rr_cd *cd,
 	struct gsm322_cellsel *cs = &ms->cellsel;
 	struct gsm48_sysinfo *s = cs->si;
 	struct gsm_settings *set = &ms->settings;
-	int i, pcs, index;
-	uint16_t arfcn;
+	int i, index;
+	uint16_t arfcn, pcs;
 
 	pcs = gsm_refer_pcs(cs->arfcn, s) ? ARFCN_PCS : 0;
 
@@ -3195,7 +4184,9 @@ static int gsm48_rr_render_ma(struct osmocom_ms *ms, struct gsm48_rr_cd *cd,
 
 	/* convert to band_arfcn and check for unsported frequency */
 	for (i = 0; i < *ma_len; i++) {
-		arfcn = ma[i] | pcs;
+		arfcn = ma[i];
+		if (arfcn >= 512 && arfcn <= 810)
+			arfcn |= pcs;
 		ma[i] = arfcn;
 		index = arfcn2index(arfcn);
 		if (!(set->freq_map[index >> 3] & (1 << (index & 7)))) {
@@ -3212,12 +4203,11 @@ static int gsm48_rr_render_ma(struct osmocom_ms *ms, struct gsm48_rr_cd *cd,
 static int gsm48_rr_dl_est(struct osmocom_ms *ms)
 {
 	struct gsm48_rrlayer *rr = &ms->rrlayer;
-	struct gsm322_cellsel *cs = &ms->cellsel;
 	struct gsm_subscriber *subscr = &ms->subscr;
+	struct gsm322_cellsel *cs = &ms->cellsel;
 	struct msgb *nmsg;
 	struct gsm48_hdr *gh;
 	struct gsm48_pag_rsp *pr;
-	uint8_t mi[11];
 	uint16_t ma[64];
 	uint8_t ma_len;
 
@@ -3294,21 +4284,18 @@ static int gsm48_rr_dl_est(struct osmocom_ms *ms)
 		if (ms->subscr.tmsi != GSM_RESERVED_TMSI
 		 && (osmo_lai_cmp(&ms->subscr.lai, &cs->sel_cgi.lai) == 0)
 		 && rr->paging_mi_type == GSM_MI_TYPE_TMSI) {
-			gsm48_generate_mid_from_tmsi(mi, subscr->tmsi);
+			gsm48_encode_mi_lv(ms, nmsg, GSM_MI_TYPE_TMSI, false);
 			LOGP(DRR, LOGL_INFO, "sending paging response with "
 				"TMSI\n");
 		} else if (subscr->imsi[0]) {
-			gsm48_generate_mid_from_imsi(mi, subscr->imsi);
+			gsm48_encode_mi_lv(ms, nmsg, GSM_MI_TYPE_IMSI, false);
 			LOGP(DRR, LOGL_INFO, "sending paging response with "
 				"IMSI\n");
 		} else {
-			mi[1] = 1;
-			mi[2] = 0xf0 | GSM_MI_TYPE_NONE;
+			gsm48_encode_mi_lv(ms, nmsg, GSM_MI_TYPE_NONE, false);
 			LOGP(DRR, LOGL_INFO, "sending paging response without "
 				"TMSI/IMSI\n");
 		}
-		msgb_put(nmsg, 1 + mi[1]);
-		memcpy(pr->data, mi + 1, 1 + mi[1]);
 	}
 
 #ifdef TEST_FREQUENCY_MOD
@@ -3382,6 +4369,12 @@ static int gsm48_rr_rel_ind(struct osmocom_ms *ms, struct msgb *msg)
 	struct msgb *nmsg;
 	struct gsm48_rr_hdr *nrrh;
 
+	/* Handle on group channel. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT) {
+		LOGP(DRR, LOGL_INFO, "Returning to group receive mode, due to link release indication.\n");
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_NORMAL);
+	}
+
 	/* switch back to old channel, if modify/ho failed */
 	switch (rr->modify_state) {
 	case GSM48_RR_MOD_ASSIGN:
@@ -3428,12 +4421,13 @@ static int gsm48_rr_rx_chan_rel(struct osmocom_ms *ms, struct msgb *msg)
 	uint8_t *mode;
 
 	if (payload_len < 0) {
-		LOGP(DRR, LOGL_NOTICE, "Short read of CHANNEL RELEASE "
-			"message.\n");
-		return gsm48_rr_tx_rr_status(ms,
-			GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+		LOGP(DRR, LOGL_NOTICE, "Short read of CHANNEL RELEASE message\n");
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
 	}
-	tlv_parse(&tp, &gsm48_rr_att_tlvdef, cr->data, payload_len, 0, 0);
+	if (tlv_parse(&tp, &gsm48_rr_att_tlvdef, cr->data, payload_len, 0, 0) < 0) {
+		LOGP(DRR, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+	}
 
 	LOGP(DRR, LOGL_INFO, "channel release request with cause 0x%02x\n",
 		cr->rr_cause);
@@ -3450,6 +4444,9 @@ static int gsm48_rr_rx_chan_rel(struct osmocom_ms *ms, struct msgb *msg)
 	}
 
 	new_rr_state(rr, GSM48_RR_ST_REL_PEND);
+
+	/* When we receive a channel release, we are not just releasing the transmit mode. */
+	rr->vgcs.group_state = GSM48_RR_GST_OFF;
 
 	/* start T3110, so that two DISCs can be sent due to T200 timeout */
 	start_rr_t3110(rr, 1, 500000);
@@ -3468,13 +4465,39 @@ static int gsm48_rr_rx_chan_rel(struct osmocom_ms *ms, struct msgb *msg)
 	return 0;
 }
 
+/* Release of channel on VGCS/VBS. */
+static int gsm48_rr_rx_chan_rel_ui(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct gsm48_hdr *gh = msgb_l3(msg);
+	struct gsm48_chan_rel *cr = (struct gsm48_chan_rel *)gh->data;
+	int payload_len = msgb_l3len(msg) - sizeof(*gh) - sizeof(*cr);
+	struct tlv_parsed tp;
+
+	if (payload_len < 0) {
+		LOGP(DRR, LOGL_NOTICE, "Short read of CHANNEL RELEASE message\n");
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+	}
+	if (tlv_parse(&tp, &gsm48_rr_att_tlvdef, cr->data, payload_len, 0, 0) < 0) {
+		LOGP(DRR, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+	}
+
+	LOGP(DRR, LOGL_INFO, "CHANNEL RELESE via UI frame with cause 0x%02x\n", cr->rr_cause);
+
+	/* Only allow when in group receive mode. */
+	if (rr->vgcs.group_state != GSM48_RR_GST_RECEIVE)
+		return 0;
+
+	return gsm48_rr_group_rel(ms, RR_REL_CAUSE_NORMAL);
+}
+
 /*
  * frequency redefition, channel mode modify, assignment, and handover
  */
 
 /* set channel mode in case of TCH */
-static int gsm48_rr_set_mode(struct osmocom_ms *ms, uint8_t chan_nr,
-	uint8_t mode)
+static int gsm48_rr_set_mode(struct osmocom_ms *ms, uint8_t chan_nr, uint8_t mode, uint8_t tch_flags)
 {
 	struct gsm48_rrlayer *rr = &ms->rrlayer;
 	uint8_t ch_type, ch_subch, ch_ts;
@@ -3491,19 +4514,10 @@ static int gsm48_rr_set_mode(struct osmocom_ms *ms, uint8_t chan_nr,
 	 && ch_type != RSL_CHAN_Lm_ACCHs)
 		return -ENOTSUP;
 
-#ifdef WITH_GAPK_IO
-	/* Poke GAPK audio back-end, if it is chosen */
-	if (ms->settings.audio.io_handler == AUDIO_IOH_GAPK) {
-		int rc = gapk_io_init_ms_chan(ms, ch_type, mode);
-		if (rc)
-			return rc;
-	}
-#endif
-
 	/* Apply indicated channel mode */
-	LOGP(DRR, LOGL_INFO, "setting TCH mode to %s, audio mode to %d\n",
-	     get_value_string(gsm48_chan_mode_names, mode), rr->audio_mode);
-	l1ctl_tx_tch_mode_req(ms, mode, rr->audio_mode, rr->tch_loop_mode);
+	LOGP(DRR, LOGL_INFO, "setting TCH mode to %s, audio mode to %d, tch flags to %d\n",
+	     get_value_string(gsm48_chan_mode_names, mode), rr->audio_mode, tch_flags);
+	l1ctl_tx_tch_mode_req(ms, mode, rr->audio_mode, tch_flags, rr->tch_loop_mode);
 
 	return 0;
 }
@@ -3555,8 +4569,7 @@ static int gsm48_rr_rx_frq_redef(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cd.h = 0;
 		gsm48_decode_chan_h0(&fr->chan_desc, &cd.tsc, &cd.arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cd.arfcn |= ARFCN_PCS;
+		cd.arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cd.arfcn);
 		LOGP(DRR, LOGL_INFO, " (ARFCN %s TS %u SS %u TSC %u)\n",
 			gsm_print_arfcn(cd.arfcn), ch_ts, ch_subch, cd.tsc);
 	}
@@ -3665,8 +4678,7 @@ static int gsm48_rr_rx_chan_modify(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cd->h = 0;
 		gsm48_decode_chan_h0(&cm->chan_desc, &cd->tsc, &cd->arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cd->arfcn |= ARFCN_PCS;
+		cd->arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cd->arfcn);
 		LOGP(DRR, LOGL_INFO, " (chan_nr 0x%02x ARFCN %s TS %u SS %u "
 			"TSC %u mode %u)\n", cm->chan_desc.chan_nr,
 			gsm_print_arfcn(cd->arfcn), ch_ts, ch_subch, cd->tsc,
@@ -3687,7 +4699,7 @@ static int gsm48_rr_rx_chan_modify(struct osmocom_ms *ms, struct msgb *msg)
 		goto ack;
 
 	/* Attempt to apply this mode */
-	rc = gsm48_rr_set_mode(ms, cd->chan_nr, cm->mode);
+	rc = gsm48_rr_set_mode(ms, cd->chan_nr, cm->mode, cd->tch_flags);
 	if (rc)
 		goto ack;
 
@@ -3781,12 +4793,13 @@ static int gsm48_rr_rx_ass_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	cdb->ind_tx_power = rr->cd_now.ind_tx_power;
 
 	if (payload_len < 0) {
-		LOGP(DRR, LOGL_NOTICE, "Short read of ASSIGNMENT COMMAND "
-			"message.\n");
-		return gsm48_rr_tx_rr_status(ms,
-			GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+		LOGP(DRR, LOGL_NOTICE, "Short read of ASSIGNMENT COMMAND message\n");
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
 	}
-	tlv_parse(&tp, &gsm48_rr_att_tlvdef, ac->data, payload_len, 0, 0);
+	if (tlv_parse(&tp, &gsm48_rr_att_tlvdef, ac->data, payload_len, 0, 0) < 0) {
+		LOGP(DRR, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+	}
 
 	/* decode channel description (before time) */
 	if (TLVP_PRESENT(&tp, GSM48_IE_CH_DESC_1_BEFORE)) {
@@ -3809,8 +4822,7 @@ static int gsm48_rr_rx_ass_cmd(struct osmocom_ms *ms, struct msgb *msg)
 		} else {
 			cdb->h = 0;
 			gsm48_decode_chan_h0(ccd, &cdb->tsc, &cdb->arfcn);
-			if (gsm_refer_pcs(cs->arfcn, s))
-				cdb->arfcn |= ARFCN_PCS;
+			cdb->arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cdb->arfcn);
 			LOGP(DRR, LOGL_INFO, " before: (chan_nr 0x%02x "
 				"ARFCN %s TS %u SS %u TSC %u)\n", ccd->chan_nr,
 				gsm_print_arfcn(cdb->arfcn),
@@ -3837,8 +4849,7 @@ static int gsm48_rr_rx_ass_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cda->h = 0;
 		gsm48_decode_chan_h0(&ac->chan_desc, &cda->tsc, &cda->arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cda->arfcn |= ARFCN_PCS;
+		cda->arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cda->arfcn);
 		LOGP(DRR, LOGL_INFO, " after: (chan_nr 0x%02x ARFCN %s TS %u "
 			"SS %u TSC %u)\n", ac->chan_desc.chan_nr,
 			gsm_print_arfcn(cda->arfcn), ch_ts, ch_subch, cda->tsc);
@@ -4046,12 +5057,6 @@ static int gsm48_rr_rx_ass_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	if (cause)
 		return gsm48_rr_tx_ass_fail(ms, cause, RSL_MT_DATA_REQ);
 
-#ifdef WITH_GAPK_IO
-	/* Poke GAPK audio back-end, if it is chosen */
-	if (ms->settings.audio.io_handler == AUDIO_IOH_GAPK)
-		gapk_io_init_ms_chan(ms, ch_type, cda->mode);
-#endif
-
 #ifdef TEST_FREQUENCY_MOD
 	LOGP(DRR, LOGL_INFO, " TESTING: frequency modify ASS.CMD\n");
 	before_time = 1;
@@ -4170,10 +5175,12 @@ static int gsm48_rr_rx_hando_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	cdb->ind_tx_power = rr->cd_now.ind_tx_power;
 
 	if (payload_len < 0) {
-		LOGP(DRR, LOGL_NOTICE, "Short read of HANDOVER COMMAND "
-			"message.\n");
-		return gsm48_rr_tx_rr_status(ms,
-			GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+		LOGP(DRR, LOGL_NOTICE, "Short read of HANDOVER COMMAND message\n");
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
+	}
+	if (tlv_parse(&tp, &gsm48_rr_att_tlvdef, ho->data, payload_len, 0, 0) < 0) {
+		LOGP(DRR, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return gsm48_rr_tx_rr_status(ms, GSM48_RR_CAUSE_PROT_ERROR_UNSPC);
 	}
 
 	/* cell description */
@@ -4182,8 +5189,6 @@ static int gsm48_rr_rx_hando_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	/* handover reference */
 	rr->chan_req_val = ho->ho_ref;
 	rr->chan_req_mask = 0x00;
-
-	tlv_parse(&tp, &gsm48_rr_att_tlvdef, ho->data, payload_len, 0, 0);
 
 	/* sync ind */
 	if (TLVP_PRESENT(&tp, GSM48_IE_SYNC_IND)) {
@@ -4214,8 +5219,7 @@ static int gsm48_rr_rx_hando_cmd(struct osmocom_ms *ms, struct msgb *msg)
 		} else {
 			cdb->h = 0;
 			gsm48_decode_chan_h0(ccd, &cdb->tsc, &cdb->arfcn);
-			if (gsm_refer_pcs(cs->arfcn, s))
-				cdb->arfcn |= ARFCN_PCS;
+			cdb->arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cdb->arfcn);
 			LOGP(DRR, LOGL_INFO, " before: (chan_nr 0x%02x "
 				"ARFCN %s TS %u SS %u TSC %u)\n", ccd->chan_nr,
 				gsm_print_arfcn(cdb->arfcn),
@@ -4242,8 +5246,7 @@ static int gsm48_rr_rx_hando_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	} else {
 		cda->h = 0;
 		gsm48_decode_chan_h0(&ho->chan_desc, &cda->tsc, &cda->arfcn);
-		if (gsm_refer_pcs(cs->arfcn, s))
-			cda->arfcn |= ARFCN_PCS;
+		cda->arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cda->arfcn);
 		LOGP(DRR, LOGL_INFO, " after: (chan_nr 0x%02x ARFCN %s TS %u "
 			"SS %u TSC %u)\n", ho->chan_desc.chan_nr,
 			gsm_print_arfcn(cda->arfcn), ch_ts, ch_subch, cda->tsc);
@@ -4489,6 +5492,16 @@ static int gsm48_rr_rx_hando_cmd(struct osmocom_ms *ms, struct msgb *msg)
 	return 0;
 }
 
+/* send HANDOVER/UPLINK ACCESS burst (9.1.14) */
+static int gsm48_rr_tx_rand_acc_dedicated(struct osmocom_ms *ms, uint8_t ref, uint16_t offset, int8_t uic)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+
+	LOGP(DRR, LOGL_INFO, "send access burst on DCCH (ref 0x%02x)\n", ref);
+
+	return l1ctl_tx_rach_req(ms, rr->cd_now.chan_nr, 0x00, ref, 0, offset, uic);
+}
+
 /* send all queued messages down to layer 2 */
 static int gsm48_rr_dequeue_down(struct osmocom_ms *ms)
 {
@@ -4511,17 +5524,27 @@ static int gsm48_rr_dequeue_down(struct osmocom_ms *ms)
 	return 0;
 }
 
-/* channel is resumed in dedicated mode */
+/* Channel is resumed in dedicated mode or uplink is estabished. */
 static int gsm48_rr_estab_cnf_dedicated(struct osmocom_ms *ms, struct msgb *msg)
 {
 	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct msgb *nmsg;
 
-	LOGP(DRR, LOGL_INFO, "data link is resumed\n");
+	if (rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT) {
+		LOGP(DRR, LOGL_INFO, "data link established on uplink\n");
 
-	/* transmit queued frames during ho / ass transition */
-	gsm48_rr_dequeue_down(ms);
+		/* Confirm uplink access. */
+		nmsg = gsm48_rr_msgb_alloc(GSM48_RR_UPLINK_CNF);
+		if (nmsg)
+			gsm48_rr_upmsg(ms, nmsg);
+	} else {
+		LOGP(DRR, LOGL_INFO, "data link is resumed\n");
 
-	rr->modify_state = GSM48_RR_MOD_NONE;
+		/* transmit queued frames during ho / ass transition */
+		gsm48_rr_dequeue_down(ms);
+
+		rr->modify_state = GSM48_RR_MOD_NONE;
+	}
 
 	return 0;
 }
@@ -4611,6 +5634,13 @@ static int gsm48_rr_est_req(struct osmocom_ms *ms, struct msgb *msg)
 	struct gsm48_rr_hdr *nrrh;
 	uint16_t acc_class;
 
+	/* Reject during group call. */
+	if (rr->vgcs.group_state != GSM48_RR_GST_OFF) {
+		LOGP(DRR, LOGL_INFO, "We have a group call, rejecting!\n");
+		cause = RR_REL_CAUSE_TRY_LATER;
+		goto reject;
+	}
+
 	/* 3.3.1.1.3.2 */
 	if (osmo_timer_pending(&rr->t3122)) {
 		if (rrh->cause != RR_EST_CAUSE_EMERGENCY) {
@@ -4698,8 +5728,315 @@ static int gsm48_rr_est_req(struct osmocom_ms *ms, struct msgb *msg)
 	memcpy(msgb_put(rr->rr_est_msg, msgb_l3len(msg)),
 		msgb_l3(msg), msgb_l3len(msg));
 
+	if (rr->vgcs.group_state == GSM48_RR_GST_RECEIVE) {
+		/* Release group receive mode. */
+		l1ctl_tx_dm_rel_req(rr->ms);
+		rr->ms->meas.rl_fail = 0;
+		l1ctl_tx_reset_req(rr->ms, L1CTL_RES_T_SCHED);
+	}
+
 	/* request channel */
 	return gsm48_rr_chan_req(ms, rrh->cause, 0, 0);
+}
+
+/* 3.3.3.2 Request for group receive mode. */
+static int gsm48_rr_group_req(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct gsm322_cellsel *cs = &ms->cellsel;
+	struct gsm48_sysinfo *s = &cs->sel_si;
+	struct gsm48_chan_desc *ch_desc = (struct gsm48_chan_desc *)(msg->data + sizeof(struct gsm48_rr_hdr));
+	uint8_t cause;
+	struct msgb *nmsg;
+	struct gsm48_rr_hdr *nrrh;
+	struct gsm48_rr_cd cd;
+	uint8_t ch_type, ch_subch, ch_ts;
+	uint16_t ma[64];
+	uint8_t ma_len;
+	int rc;
+
+	/* if state is not idle */
+	if (rr->state != GSM48_RR_ST_IDLE || rr->vgcs.group_state != GSM48_RR_GST_OFF) {
+		LOGP(DRR, LOGL_INFO, "We are not IDLE yet, rejecting!\n");
+		cause = RR_REL_CAUSE_TRY_LATER;
+reject:
+		LOGP(DSUM, LOGL_INFO, "Joining group call channel not possible\n");
+		nmsg = gsm48_rr_msgb_alloc(GSM48_RR_GROUP_REL_IND);
+		if (!nmsg)
+			return -ENOMEM;
+		nrrh = (struct gsm48_rr_hdr *)nmsg->data;
+		nrrh->cause = cause;
+		return gsm48_rr_upmsg(ms, nmsg);
+	}
+
+	/* cell selected */
+	if (!cs->selected) {
+		LOGP(DRR, LOGL_INFO, "No cell selected, rejecting!\n");
+		cause = RR_REL_CAUSE_TRY_LATER;
+		goto reject;
+	}
+
+	/* check if camping */
+	if (cs->state != GSM322_C3_CAMPED_NORMALLY
+	 && cs->state != GSM322_C7_CAMPED_ANY_CELL) {
+		LOGP(DRR, LOGL_INFO, "Not camping, rejecting! "
+			"(cs->state = %d)\n", cs->state);
+		cause = RR_REL_CAUSE_TRY_LATER;
+		goto reject;
+	}
+
+	/* get channel description */
+	memset(&cd, 0, sizeof(cd));
+	cd.chan_nr = ch_desc->chan_nr;
+	if (rsl_dec_chan_nr(cd.chan_nr, &ch_type, &ch_subch, &ch_ts) != 0) {
+		LOGP(DRR, LOGL_ERROR,
+		     "%s(): rsl_dec_chan_nr(chan_nr=0x%02x) failed\n",
+		     __func__, cd.chan_nr);
+		cause = GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		goto reject;
+	}
+	if (ch_desc->h0.h) {
+		LOGP(DRR, LOGL_ERROR, "HOPPING NOT SUPPORTED, PLEASE FIX!\n");
+		cd.h = 1;
+		gsm48_decode_chan_h1(ch_desc, &cd.tsc, &cd.maio,
+			&cd.hsn);
+		LOGP(DRR, LOGL_INFO, " (chan_nr 0x%02x MAIO %u HSN %u TS %u SS %u TSC %u)\n",
+		     ch_desc->chan_nr, cd.maio, cd.hsn, ch_ts, ch_subch, cd.tsc);
+	} else {
+		cd.h = 0;
+		gsm48_decode_chan_h0(ch_desc, &cd.tsc, &cd.arfcn);
+		cd.arfcn = gsm_arfcn_refer_pcs(cs->arfcn, s, cd.arfcn);
+		LOGP(DRR, LOGL_INFO, " (chan_nr 0x%02x ARFCN %s TS %u SS %u TSC %u)\n",
+		     ch_desc->chan_nr, gsm_print_arfcn(cd.arfcn), ch_ts, ch_subch, cd.tsc);
+	}
+	if (gsm48_rr_render_ma(ms, &rr->vgcs.cd_group, ma, &ma_len)) {
+		cause = GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		goto reject;
+	}
+
+	/* Turn off transmitter. */
+	cd.tch_flags |= L1CTL_TCH_FLAG_RXONLY;
+
+	/* Set mode to Speech V1. FIXME: Add AMR support. */
+	cd.mode = GSM48_CMODE_SPEECH_V1;
+
+	/* Set current channel and also store as 'vgcs.cd_group', used when leaving dedicated mode. */
+	memcpy(&rr->cd_now, &cd, sizeof(rr->cd_now));
+	memcpy(&rr->vgcs.cd_group, &cd, sizeof(rr->vgcs.cd_group));
+
+	/* tell cell selection process to leave idle mode
+	 * NOTE: this must be sent unbuffered, because the state may not
+	 * change until idle mode is left
+	 */
+	nmsg = gsm322_msgb_alloc(GSM322_EVENT_LEAVE_IDLE);
+	if (!nmsg)
+		return -ENOMEM;
+	rc = gsm322_c_event(ms, nmsg);
+	msgb_free(nmsg);
+	if (rc) {
+		LOGP(DRR, LOGL_INFO, "Failed to leave IDLE mode.\n");
+		cause = GSM48_RR_CAUSE_CHAN_MODE_UNACCT;
+		goto reject;
+	}
+
+	/* Initial uplink state. */
+	rr->vgcs.uplink_free = false;
+
+	/* Set group state to receive mode. */
+	rr->vgcs.group_state = GSM48_RR_GST_RECEIVE;
+
+	/* Wait until synced to the CCCH ... */
+	return 0;
+}
+/* ... Continue after synced to the CCCH. */
+static int gsm48_rr_group_req_continue(struct osmocom_ms *ms)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	uint16_t ma[64];
+	uint8_t ma_len;
+	struct msgb *nmsg;
+
+	/* get hopping sequence, if required */
+	gsm48_rr_render_ma(ms, &rr->vgcs.cd_group, ma, &ma_len);
+	/* activate channel */
+	gsm48_rr_activate_channel(ms, &rr->vgcs.cd_group, ma, ma_len);
+
+	/* Confirm group call channel. */
+	nmsg = gsm48_rr_msgb_alloc(GSM48_RR_GROUP_CNF);
+	if (!nmsg)
+		return -ENOMEM;
+	return gsm48_rr_upmsg(ms, nmsg);
+}
+
+/* After "loss of signal"/release in group transmit or receive mode, return IDLE and release towards MM. */
+static int gsm48_rr_group_rel(struct osmocom_ms *ms, int cause)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct msgb *nmsg;
+	struct gsm48_rr_hdr *nrrh;
+	uint8_t *mode;
+
+	/* Stop group receive and transmit timers. */
+	stop_rr_t_ul_free(rr);
+	stop_rr_t3128(rr);
+	stop_rr_t3130(rr);
+
+	if (rr->state == GSM48_RR_ST_DEDICATED || rr->state == GSM48_RR_ST_REL_PEND) {
+		struct msgb *nmsg;
+
+		LOGP(DRR, LOGL_INFO, "Channel lost, send (local) release to layer 2.\n");
+
+		/* Go into group receive mode, so that the channel gets released on LAPD release confirm. */
+		rr->vgcs.group_state = GSM48_RR_GST_RECEIVE;
+		if (rr->state != GSM48_RR_ST_REL_PEND)
+			new_rr_state(rr, GSM48_RR_ST_REL_PEND);
+
+		/* release message */
+		nmsg = gsm48_l3_msgb_alloc();
+		if (!nmsg)
+			return -ENOMEM;
+		mode = msgb_put(nmsg, 2);
+		mode[0] = RSL_IE_RELEASE_MODE;
+		mode[1] = RSL_REL_LOCAL_END;
+		gsm48_send_rsl_nol3(ms, RSL_MT_REL_REQ, nmsg, 0);
+
+		/* release SAPI 3 link, if exits */
+		gsm48_release_sapi3_link(ms);
+
+		/* Wait for LAPD to confirm. Then return idle. */
+		return 0;
+	}
+
+	/* Go back to IDLE mode. */
+	rr->vgcs.group_state = GSM48_RR_GST_OFF;
+	new_rr_state(rr, GSM48_RR_ST_IDLE);
+
+	/* Indicate release to MM. */
+	nmsg = gsm48_rr_msgb_alloc(GSM48_RR_GROUP_REL_IND);
+	if (!nmsg)
+		return -ENOMEM;
+	nrrh = (struct gsm48_rr_hdr *)nmsg->data;
+	nrrh->cause = cause;
+	return gsm48_rr_upmsg(ms, nmsg);
+}
+
+/* Release group channel, return to IDLE. */
+static int gsm48_rr_group_rel_req(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+
+	/* Only in group receive/transmit mode. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_OFF)
+		return 0;
+
+	if (rr->state == GSM48_RR_ST_CONN_PEND || rr->state == GSM48_RR_ST_DEDICATED) {
+		LOGP(DRR, LOGL_INFO, "Connot release group channel yet, perform uplink release first.\n");
+		gsm48_rr_uplink_rel_req(ms, msg);
+		if (rr->state == GSM48_RR_ST_REL_PEND) {
+			/* Leave the group call state, so that we change to IDLE when we released the uplink. */
+			rr->vgcs.group_state = GSM48_RR_GST_OFF;
+			return 0;
+		}
+	}
+
+	/* Stop group receive and transmit timers. */
+	stop_rr_t_ul_free(rr);
+	stop_rr_t3128(rr);
+	stop_rr_t3130(rr);
+
+	/* Unset group state. Wait, if release is pending. */
+	rr->vgcs.group_state = GSM48_RR_GST_OFF;
+	if (rr->state != GSM48_RR_ST_IDLE) {
+		LOGP(DRR, LOGL_INFO, "Cannot release group channel yet, wait to return to IDLE state.\n");
+		return 0;
+	}
+
+	LOGP(DRR, LOGL_INFO, "Release Group channel.\n");
+	new_rr_state(rr, GSM48_RR_ST_IDLE);
+	return 0;
+}
+
+/* Request uplink in group receive mode. */
+static int gsm48_rr_uplink_req(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct msgb *nmsg;
+	struct gsm48_rr_hdr *nrrh;
+
+	/* Only in group receive mode */
+	if (rr->state != GSM48_RR_ST_IDLE || rr->vgcs.group_state != GSM48_RR_GST_RECEIVE) {
+		LOGP(DRR, LOGL_INFO, "We are not in group receive mode yet, rejecting!\n");
+		nmsg = gsm48_rr_msgb_alloc(GSM48_RR_UPLINK_REL_IND);
+		if (!nmsg)
+			return -ENOMEM;
+		nrrh = (struct gsm48_rr_hdr *)nmsg->data;
+		nrrh->cause = RR_REL_CAUSE_TRY_LATER;
+		return gsm48_rr_upmsg(ms, nmsg);
+	}
+
+	LOGP(DRR, LOGL_INFO, "Changing from group receive mode to group transmit mode.\n");
+
+	/* Enter uplink access procedure. */
+	new_rr_state(rr, GSM48_RR_ST_CONN_PEND);
+
+	/* Set group state to transmit mode. */
+	rr->vgcs.group_state = GSM48_RR_GST_TRANSMIT;
+
+	/* Uplink investigation procedure (3.3.1.2.1.1) */
+	if (!rr->vgcs.uplink_free) {
+		start_rr_t3128(rr, GSM_T3128_MS);
+		return 0;
+	}
+
+	rr->vgcs.uplink_tries = 3;
+	return gsm48_rr_uplink_access(ms, NULL);
+}
+
+/* Leave uplink, also called when leaving group channel. */
+static int gsm48_rr_uplink_rel_req(struct osmocom_ms *ms, struct msgb *msg)
+{
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	struct gsm_settings *set = &ms->settings;
+	struct msgb *nmsg;
+	uint8_t *mode;
+
+	/* Only in group transmit mode */
+	if (rr->vgcs.group_state != GSM48_RR_GST_TRANSMIT)
+		return -EINVAL;
+
+	/* Stop group transmit mode timers. */
+	stop_rr_t3128(rr);
+	stop_rr_t3130(rr);
+
+	/* Continue if in dedicated mode, so we release and wait for uplink to become free. */
+	if (rr->state != GSM48_RR_ST_DEDICATED)
+		return 0;
+
+	LOGP(DRR, LOGL_INFO, "Returning from group transmit to group receive mode.\n");
+
+	/* Leave uplink, wait for uplink being free, channel release or channel/link failure. */
+	gsm48_rr_tx_uplink_release(ms, GSM48_RR_CAUSE_LEAVE_GROUP_CA);
+
+	/* Go into release pending mode. */
+	new_rr_state(rr, GSM48_RR_ST_REL_PEND);
+
+	/* Special setting where we release locally. This means we wait for free uplink an then release. */
+	if (set->uplink_release_local) {
+		LOGP(DRR, LOGL_INFO, "Release L2 locally as specified via VTY. Wait for UPLINK FREE.\n");
+		return 0;
+	}
+
+	/* Release dedicated mode. */
+	/* disconnect the main signalling link */
+	nmsg = gsm48_l3_msgb_alloc();
+	if (!nmsg)
+		return -ENOMEM;
+	mode = msgb_put(nmsg, 2);
+	mode[0] = RSL_IE_RELEASE_MODE;
+	mode[1] = RSL_REL_NORMAL;
+	gsm48_send_rsl_nol3(ms, RSL_MT_REL_REQ, nmsg, 0);
+
+	return 0;
 }
 
 /* 3.4.2 transfer data in dedicated mode */
@@ -4746,6 +6083,8 @@ static int gsm48_rr_data_req(struct osmocom_ms *ms, struct msgb *msg)
 /* 3.4.2 data from layer 2 to RR and upper layer*/
 static int gsm48_rr_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 {
+	struct abis_rsl_rll_hdr *rllh = msgb_l2(msg);
+	uint8_t sapi = rllh->link_id & 7;
 	struct gsm48_hdr *gh = msgb_l3(msg);
 	struct gsm48_rr_hdr *rrh;
 	uint8_t pdisc = gh->proto_discr & 0x0f;
@@ -4785,6 +6124,9 @@ static int gsm48_rr_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 		case GSM48_MT_RR_CHAN_REL:
 			rc = gsm48_rr_rx_chan_rel(ms, msg);
 			break;
+		case GSM48_MT_RR_UPLINK_RELEASE:
+			rc = gsm48_rr_rx_uplink_release(ms, msg);
+			break;
 		case GSM48_MT_RR_APP_INFO:
 			LOGP(DRR, LOGL_NOTICE, "APP INFO not supported!\n");
 			break;
@@ -4811,6 +6153,7 @@ static int gsm48_rr_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 	msgb_push(msg, sizeof(struct gsm48_rr_hdr));
 	rrh = (struct gsm48_rr_hdr *)msg->data;
 	rrh->msg_type = GSM48_RR_DATA_IND;
+	rrh->sapi = sapi;
 
 	return gsm48_rr_upmsg(ms, msg);
 }
@@ -4849,6 +6192,11 @@ static int gsm48_rr_rx_pch_agch(struct osmocom_ms *ms, struct msgb *msg)
 {
 	struct gsm48_system_information_type_header *sih = msgb_l3(msg);
 
+	if (msgb_l3len(msg) < sizeof(*sih)) {
+		LOGP(DRR, LOGL_NOTICE, "Short read of CCCH message.\n");
+		return -EINVAL;
+	}
+
 	switch (sih->system_information) {
 	case GSM48_MT_RR_PAG_REQ_1:
 		return gsm48_rr_rx_pag_req_1(ms, msg);
@@ -4863,6 +6211,10 @@ static int gsm48_rr_rx_pch_agch(struct osmocom_ms *ms, struct msgb *msg)
 		return gsm48_rr_rx_imm_ass_ext(ms, msg);
 	case GSM48_MT_RR_IMM_ASS_REJ:
 		return gsm48_rr_rx_imm_ass_rej(ms, msg);
+
+	case GSM48_MT_RR_NOTIF_NCH:
+		return gsm48_rr_rx_notif_nch(ms, msg);
+
 	default:
 #if 0
 		LOGP(DRR, LOGL_NOTICE, "CCCH message type 0x%02x unknown.\n",
@@ -4872,48 +6224,70 @@ static int gsm48_rr_rx_pch_agch(struct osmocom_ms *ms, struct msgb *msg)
 	}
 }
 
+#define N201_Bter_SACCH		21
+#define N201_Bter_SDCCH_FACCH	23
+#define N201_B4			19
+
 /* receive ACCH at RR layer */
 static int gsm48_rr_rx_acch(struct osmocom_ms *ms, struct msgb *msg)
 {
-	struct gsm48_rrlayer *rr = &ms->rrlayer;
-	struct gsm_settings *set = &ms->settings;
-	struct abis_rsl_rll_hdr *rllh = msgb_l2(msg);
-	struct gsm48_system_information_type_header *sih = msgb_l3(msg);
-	uint8_t ind_ta, ind_tx_power;
+	const struct gsm48_system_information_type_header *sih;
+	const struct gsm48_hdr_sh *sgh;
+	const struct gsm48_hdr *gh;
 
-	if (msgb_l2len(msg) < sizeof(*rllh) + 2 + 2) {
-		LOGP(DRR, LOGL_ERROR, "Missing TA and TX_POWER IEs\n");
+	/* Bter frame (SACCH or SDCCH/FACCH) */
+	if (msgb_l3len(msg) == N201_Bter_SACCH || msgb_l3len(msg) == N201_Bter_SDCCH_FACCH) {
+		sgh = msgb_l3(msg);
+		if (sgh->rr_short_pd != GSM48_PDISC_SH_RR) {
+			LOGP(DRR, LOGL_NOTICE, "Short header message is not an RR message.\n");
+			return -EINVAL;
+		}
+		switch (sgh->msg_type) {
+		case GSM48_MT_RR_SH_UL_FREE:
+			return gsm48_rr_rx_uplink_free(ms, msg);
+		case GSM48_MT_RR_SH_FACCH:
+			return gsm48_rr_rx_notif_facch(ms, msg);
+		case GSM48_MT_RR_SH_SI10:
+			return gsm48_rr_rx_sysinfo_10(ms, msg);
+		default:
+			LOGP(DRR, LOGL_NOTICE, "Short header message type 0x%02x unsupported.\n", sgh->msg_type);
+			return -EINVAL;
+		}
+	}
+
+	/* B4 frame (SACCH) */
+	if ((msg->cb[0] & 0x40) && msgb_l3len(msg) == N201_B4) {
+		sih = msgb_l3(msg);
+		switch (sih->system_information) {
+		case GSM48_MT_RR_SYSINFO_5:
+			return gsm48_rr_rx_sysinfo5(ms, msg);
+		case GSM48_MT_RR_SYSINFO_5bis:
+			return gsm48_rr_rx_sysinfo5bis(ms, msg);
+		case GSM48_MT_RR_SYSINFO_5ter:
+			return gsm48_rr_rx_sysinfo5ter(ms, msg);
+		case GSM48_MT_RR_SYSINFO_6:
+			return gsm48_rr_rx_sysinfo6(ms, msg);
+		default:
+			LOGP(DRR, LOGL_NOTICE, "ACCH message type 0x%02x unknown.\n", sih->system_information);
+			return -EINVAL;
+		}
+	}
+
+	/* B frame (UI frame on VGCS) */
+	if (msgb_l3len(msg) < sizeof(*gh)) {
+		LOGP(DRR, LOGL_NOTICE, "ACCH message too short.\n");
 		return -EINVAL;
 	}
-
-	ind_ta = rllh->data[1];
-	ind_tx_power = rllh->data[3];
-	LOGP(DRR, LOGL_INFO, "DL SACCH indicates ta %d (actual ta %d)\n",
-		ind_ta, ind_ta - set->alter_delay);
-	LOGP(DRR, LOGL_INFO, "DL SACCH indicates tx_power %d\n",
-		ind_tx_power);
-	if (ind_ta != rr->cd_now.ind_ta
-	 || ind_tx_power != rr->cd_now.ind_tx_power) {
-		LOGP(DRR, LOGL_INFO, "Applying new ta and tx_power\n");
-		l1ctl_tx_param_req(ms, ind_ta - set->alter_delay,
-			(set->alter_tx_power) ? set->alter_tx_power_value
-						: ind_tx_power);
-		rr->cd_now.ind_ta = ind_ta;
-		rr->cd_now.ind_tx_power = ind_tx_power;
-	}
-
-	switch (sih->system_information) {
-	case GSM48_MT_RR_SYSINFO_5:
-		return gsm48_rr_rx_sysinfo5(ms, msg);
-	case GSM48_MT_RR_SYSINFO_5bis:
-		return gsm48_rr_rx_sysinfo5bis(ms, msg);
-	case GSM48_MT_RR_SYSINFO_5ter:
-		return gsm48_rr_rx_sysinfo5ter(ms, msg);
-	case GSM48_MT_RR_SYSINFO_6:
-		return gsm48_rr_rx_sysinfo6(ms, msg);
+	gh = msgb_l3(msg);
+	switch (gh->msg_type) {
+	case GSM48_MT_RR_VGCS_UPL_GRANT:
+		return gsm48_rr_rx_vgcs_uplink_grant(ms, msg);
+	case GSM48_MT_RR_UPLINK_BUSY:
+		return gsm48_rr_rx_uplink_busy(ms, msg);
+	case GSM48_MT_RR_CHAN_REL:
+		return gsm48_rr_rx_chan_rel_ui(ms, msg);
 	default:
-		LOGP(DRR, LOGL_NOTICE, "ACCH message type 0x%02x unknown.\n",
-			sih->system_information);
+		LOGP(DRR, LOGL_NOTICE, "ACCH message type 0x%02x unknown.\n", gh->msg_type);
 		return -EINVAL;
 	}
 }
@@ -4921,9 +6295,12 @@ static int gsm48_rr_rx_acch(struct osmocom_ms *ms, struct msgb *msg)
 /* unit data from layer 2 to RR layer */
 static int gsm48_rr_unit_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 {
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
 	struct gsm322_cellsel *cs = &ms->cellsel;
+	struct gsm_settings *set = &ms->settings;
 	struct abis_rsl_rll_hdr *rllh = msgb_l2(msg);
 	struct tlv_parsed tv;
+	int ind_ta = -1, ind_tx_power = -1;
 	uint8_t ch_type, ch_subch, ch_ts;
 
 	DEBUGP(DRSL, "RSLms UNIT DATA IND chan_nr=0x%02x link_id=0x%02x\n",
@@ -4932,6 +6309,24 @@ static int gsm48_rr_unit_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 	if (rsl_tlv_parse(&tv, rllh->data, msgb_l2len(msg) - sizeof(*rllh)) < 0) {
 		LOGP(DRSL, LOGL_ERROR, "%s(): rsl_tlv_parse() failed\n", __func__);
 		return -EINVAL;
+	}
+
+	/* Update TX power and timing advance, if included in message. */
+	if (TLVP_PRES_LEN(&tv, RSL_IE_TIMING_ADVANCE, 1)) {
+		ind_ta = *TLVP_VAL(&tv, RSL_IE_TIMING_ADVANCE);
+		LOGP(DRR, LOGL_INFO, "DL SACCH indicates ta %d (actual ta %d)\n", ind_ta, ind_ta - set->alter_delay);
+	}
+	if (TLVP_PRES_LEN(&tv, RSL_IE_MS_POWER, 1)) {
+		ind_tx_power = *TLVP_VAL(&tv, RSL_IE_MS_POWER);
+		LOGP(DRR, LOGL_INFO, "DL SACCH indicates tx_power %d\n", ind_tx_power);
+	}
+	if ((ind_ta >= 0 && ind_ta != rr->cd_now.ind_ta) ||
+	    (ind_tx_power >= 0 && ind_tx_power != rr->cd_now.ind_tx_power)) {
+		LOGP(DRR, LOGL_INFO, "Applying new ta and tx_power\n");
+		l1ctl_tx_param_req(ms, ind_ta - set->alter_delay,
+			(set->alter_tx_power) ? set->alter_tx_power_value : ind_tx_power);
+		rr->cd_now.ind_ta = ind_ta;
+		rr->cd_now.ind_tx_power = ind_tx_power;
 	}
 
 	if (!TLVP_PRESENT(&tv, RSL_IE_L3_INFO)) {
@@ -4948,6 +6343,10 @@ static int gsm48_rr_unit_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 	if (cs->ccch_state != GSM322_CCCH_ST_DATA) {
 		LOGP(DCS, LOGL_INFO, "Channel provides data.\n");
 		cs->ccch_state = GSM322_CCCH_ST_DATA;
+
+		/* in group receive mode */
+		if (ms->rrlayer.vgcs.group_state == GSM48_RR_GST_RECEIVE)
+			return gsm48_rr_group_req_continue(ms);
 
 		/* in dedicated mode */
 		if (ms->rrlayer.state == GSM48_RR_ST_CONN_PEND)
@@ -4983,6 +6382,7 @@ static int gsm48_rr_unit_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 	case RSL_CHAN_Lm_ACCHs:
 	case RSL_CHAN_SDCCH4_ACCH:
 	case RSL_CHAN_SDCCH8_ACCH:
+		msg->cb[0] = rllh->link_id;
 		return gsm48_rr_rx_acch(ms, msg);
 	default:
 		LOGP(DRSL, LOGL_NOTICE, "RSL with chan_nr 0x%02x unknown.\n",
@@ -5041,6 +6441,12 @@ static int gsm48_rr_rel_cnf(struct osmocom_ms *ms, struct msgb *msg)
 	uint16_t ma[64];
 	uint8_t ma_len;
 
+	/* Handle on group channel. */
+	if (rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT) {
+		LOGP(DRR, LOGL_INFO, "Returning to group receive mode, due to link release confirm.\n");
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_NORMAL);
+	}
+
 	/* switch back to old channel, if modify/ho failed */
 	switch (rr->modify_state) {
 	case GSM48_RR_MOD_ASSIGN:
@@ -5087,7 +6493,11 @@ static int gsm48_rr_rel_cnf(struct osmocom_ms *ms, struct msgb *msg)
 	stop_rr_t3110(rr);
 
 	/* send release indication */
-	nmsg = gsm48_rr_msgb_alloc(GSM48_RR_REL_IND);
+	if (rr->vgcs.group_state == GSM48_RR_GST_RECEIVE) {
+		nmsg = gsm48_rr_msgb_alloc(GSM48_RR_GROUP_REL_IND);
+		rr->vgcs.group_state = GSM48_RR_GST_OFF;
+	} else
+		nmsg = gsm48_rr_msgb_alloc(GSM48_RR_REL_IND);
 	if (!nmsg)
 		return -ENOMEM;
 	nrrh = (struct gsm48_rr_hdr *)nmsg->data;
@@ -5134,6 +6544,12 @@ static int gsm48_rr_mdl_error_ind(struct osmocom_ms *ms, struct msgb *msg)
 	/* in case of modify/hando: wait for confirm */
 	if (rr->modify_state)
 		return 0;
+
+	/* Handle on group channel. */
+	if ((link_id & 7) == 0 && rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT) {
+		LOGP(DRR, LOGL_INFO, "Returning to group receive mode, due to link failure.\n");
+		return gsm48_rr_uplink_access_abort(ms, RR_REL_CAUSE_LINK_FAILURE);
+	}
 
 	/* send abort ind to upper layer */
 	nmsg = gsm48_rr_msgb_alloc(GSM48_RR_ABORT_IND);
@@ -5397,11 +6813,6 @@ static struct dldatastate {
 	{SBIT(GSM48_RR_ST_DEDICATED),
 	 RSL_MT_SUSP_CONF, gsm48_rr_susp_cnf_dedicated},
 
-#if 0
-	{SBIT(GSM48_RR_ST_DEDICATED),
-	 RSL_MT_CHAN_CNF, gsm48_rr_rand_acc_cnf_dedicated},
-#endif
-
 	{SBIT(GSM48_RR_ST_DEDICATED),
 	 RSL_MT_ERROR_IND, gsm48_rr_mdl_error_ind},
 };
@@ -5498,11 +6909,24 @@ static int gsm48_rcv_cch(struct osmocom_ms *ms, struct msgb *msg)
 		"%s\n", ms->name, rsl_msg_name(msg_type),
 		gsm48_rr_state_names[rr->state]);
 
-	if (rr->state == GSM48_RR_ST_CONN_PEND
-	 && msg_type == RSL_MT_CHAN_CONF) {
-	 	rc = gsm48_rr_tx_rand_acc(ms, msg);
-		msgb_free(msg);
-		return rc;
+	if (msg_type == RSL_MT_CHAN_CONF) {
+		/* Recevie confirm to get the FN when the access burst was transmitted on VGCS channel. */
+		if (rr->state == GSM48_RR_ST_CONN_PEND && rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT) {
+			rc = gsm48_rr_uplink_access(ms, msg);
+			msgb_free(msg);
+			return rc;
+		}
+		/* Ignore subsequent access bursts in dedicated group transmit mode. */
+		if (rr->state == GSM48_RR_ST_DEDICATED && rr->vgcs.group_state == GSM48_RR_GST_TRANSMIT) {
+			msgb_free(msg);
+			return 0;
+		}
+		/* Recevie confirm to get the FN when the access burst was transmitted on CCCH. */
+		if (rr->state == GSM48_RR_ST_CONN_PEND) {
+			rc = gsm48_rr_tx_rand_acc(ms, msg);
+			msgb_free(msg);
+			return rc;
+		}
 	}
 
 	LOGP(DRSL, LOGL_NOTICE, "RSLms message unhandled\n");
@@ -5554,6 +6978,20 @@ static struct rrdownstate {
 	{SBIT(GSM48_RR_ST_CONN_PEND) |
 	 SBIT(GSM48_RR_ST_DEDICATED), /* 3.4.13.3 */
 	 GSM48_RR_ABORT_REQ, gsm48_rr_abort_req},
+
+	/* NOTE: If not IDLE, it is rejected there. */
+	{ALL_STATES, /* 3.3.3.2 */
+	 GSM48_RR_GROUP_REQ, gsm48_rr_group_req},
+
+	{ALL_STATES,
+	 GSM48_RR_GROUP_REL_REQ, gsm48_rr_group_rel_req},
+
+	/* NOTE: If not IDLE, it is rejected there. */
+	{ALL_STATES, /* 3.3.1.2 */
+	 GSM48_RR_UPLINK_REQ, gsm48_rr_uplink_req},
+
+	{ALL_STATES, /* 3.4.13.4 */
+	 GSM48_RR_UPLINK_REL_REQ, gsm48_rr_uplink_rel_req},
 };
 
 #define RRDOWNSLLEN \
@@ -5649,20 +7087,10 @@ int gsm48_rr_init(struct osmocom_ms *ms)
 	start_rr_t_meas(rr, 1, 0);
 
 	rr->tch_loop_mode = L1CTL_TCH_LOOP_OPEN;
+	rr->audio_mode = 0x00; /* set in tch_{voice,data}_state_init() */
 
-	/* Configure audio handling in the L1PHY */
-	switch (ms->settings.audio.io_handler) {
-	case AUDIO_IOH_L1PHY:
-		rr->audio_mode = AUDIO_RX_SPEAKER | AUDIO_TX_MICROPHONE;
-		break;
-	case AUDIO_IOH_MNCC_SOCK:
-	case AUDIO_IOH_LOOPBACK:
-	case AUDIO_IOH_GAPK:
-		rr->audio_mode = AUDIO_RX_TRAFFIC_IND | AUDIO_TX_TRAFFIC_REQ;
-		break;
-	case AUDIO_IOH_NONE:
-		rr->audio_mode = 0x00;
-	}
+	/* List of notifications about ongoing ASCI calls */
+	INIT_LLIST_HEAD(&rr->vgcs.notif_list);
 
 	return 0;
 }
@@ -5692,6 +7120,12 @@ int gsm48_rr_exit(struct osmocom_ms *ms)
 	stop_rr_t3122(rr);
 	stop_rr_t3124(rr);
 	stop_rr_t3126(rr);
+	stop_rr_t_ul_free(rr);
+	stop_rr_t3128(rr);
+	stop_rr_t3130(rr);
+
+	/* Free pending list entries. */
+	asci_notif_list_free(rr);
 
 	return 0;
 }
@@ -5735,57 +7169,9 @@ static void start_rr_t3124(struct gsm48_rrlayer *rr, int sec, int micro)
 	osmo_timer_schedule(&rr->t3124, sec, micro);
 }
 
-/* send HANDOVER ACCESS burst (9.1.14) */
-static int gsm48_rr_tx_hando_access(struct osmocom_ms *ms)
-{
-	nmsg = msgb_alloc_headroom(20, 16, "HAND_ACCESS");
-	if (!nmsg)
-		return -ENOMEM;
-	*msgb_put(nmsg, 1) = rr->hando_ref;
-	todo burst
-	return gsm48_send_rsl(ms, RSL_MT_RAND_ACC_REQ, nmsg, 0);
-}
-
-/* send next channel request in dedicated state */
-static int gsm48_rr_rand_acc_cnf_dedicated(struct osmocom_ms *ms, struct msgb *msg)
-{
-	struct gsm48_rrlayer *rr = &ms->rrlayer;
-	struct msgb *nmsg;
-	int s;
-
-	if (rr->modify_state != GSM48_RR_MOD_HANDO) {
-		LOGP(DRR, LOGL_NOTICE, "Random access confirm, but not in handover state.\n");
-		return 0;
-	}
-
-	/* send up to four handover access bursts */
-	if (rr->hando_acc_left) {
-		rr->hando_acc_left--;
-		gsm48_rr_tx_hando_access(ms);
-		return;
-	}
-
-	/* start timer for sending next HANDOVER ACCESS bursts afterwards */
-	if (!osmo_timer_pending(&rr->t3124)) {
-		if (allocated channel is SDCCH)
-			start_rr_t3124(rr, GSM_T3124_675);
-		else
-			start_rr_t3124(rr, GSM_T3124_320);
-	}
-	if (!rr->n_chan_req) {
-		start_rr_t3126(rr, 5, 0); /* TODO improve! */
-		return 0;
-	}
-	rr->n_chan_req--;
-
-	/* wait for PHYSICAL INFORMATION message or T3124 timeout */
-	return 0;
-
-}
-
 #endif
 
-int gsm48_rr_tx_voice(struct osmocom_ms *ms, struct msgb *msg)
+int gsm48_rr_tx_traffic(struct osmocom_ms *ms, struct msgb *msg)
 {
 	struct gsm48_rrlayer *rr = &ms->rrlayer;
 	uint8_t ch_type, ch_subch, ch_ts;
@@ -5836,5 +7222,5 @@ int gsm48_rr_audio_mode(struct osmocom_ms *ms, uint8_t mode)
 	 && ch_type != RSL_CHAN_Lm_ACCHs)
 		return 0;
 
-	return l1ctl_tx_tch_mode_req(ms, rr->cd_now.mode, mode, rr->tch_loop_mode);
+	return l1ctl_tx_tch_mode_req(ms, rr->cd_now.mode, mode, rr->cd_now.tch_flags, rr->tch_loop_mode);
 }

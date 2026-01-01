@@ -35,13 +35,13 @@
 #include <osmocom/bb/mobile/gsm480_ss.h>
 #include <osmocom/bb/mobile/gsm48_mm.h>
 #include <osmocom/bb/mobile/gsm48_cc.h>
+#include <osmocom/bb/mobile/gsm44068_gcc_bcc.h>
 #include <osmocom/bb/mobile/gsm411_sms.h>
 #include <osmocom/bb/mobile/gsm322.h>
 #include <osmocom/bb/mobile/vty.h>
 #include <osmocom/bb/mobile/app_mobile.h>
 #include <osmocom/bb/mobile/mncc.h>
-#include <osmocom/bb/mobile/voice.h>
-#include <osmocom/bb/mobile/gapk_io.h>
+#include <osmocom/bb/mobile/tch.h>
 #include <osmocom/bb/mobile/primitives.h>
 
 #include <osmocom/vty/vty.h>
@@ -81,10 +81,6 @@ int mobile_work(struct osmocom_ms *ms)
 		w |= gsm322_cs_dequeue(ms);
 		w |= gsm_sim_job_dequeue(ms);
 		w |= mncc_dequeue(ms);
-#ifdef WITH_GAPK_IO
-		if (ms->gapk_io != NULL)
-			w |= gapk_io_serve_ms(ms);
-#endif
 		if (w)
 			work = 1;
 	} while (w);
@@ -199,12 +195,6 @@ int mobile_exit(struct osmocom_ms *ms, int force)
 		return -EBUSY;
 	}
 
-#ifdef WITH_GAPK_IO
-	/* Clean up GAPK state, if preset */
-	if (ms->gapk_io != NULL)
-		gapk_io_clean_up_ms(ms);
-#endif
-
 	gsm322_exit(ms);
 	gsm48_mm_exit(ms);
 	gsm48_rr_exit(ms);
@@ -212,6 +202,7 @@ int mobile_exit(struct osmocom_ms *ms, int force)
 	gsm48_cc_exit(ms);
 	gsm480_ss_exit(ms);
 	gsm411_sms_exit(ms);
+	gsm44068_gcc_exit(ms);
 	gsm_sim_exit(ms);
 	lapdm_channel_exit(&ms->lapdm_channel);
 
@@ -247,13 +238,15 @@ static int mobile_init(struct osmocom_ms *ms)
 	lapdm_channel_init3(&ms->lapdm_channel, LAPDM_MODE_MS,
 			    t200_ms_dcch, t200_ms_acch,
 			    GSM_LCHAN_SDCCH, NULL);
+	lapdm_channel_set_flags(&ms->lapdm_channel, LAPDM_ENT_F_DROP_2ND_REJ);
 	lapdm_channel_set_l1(&ms->lapdm_channel, l1ctl_ph_prim_cb, ms);
 
 	gsm_sim_init(ms);
 	gsm48_cc_init(ms);
 	gsm480_ss_init(ms);
 	gsm411_sms_init(ms);
-	gsm_voice_init(ms);
+	gsm44068_gcc_init(ms);
+	tch_init(ms);
 	gsm_subscr_init(ms);
 	gsm48_rr_init(ms);
 	gsm48_mm_init(ms);
@@ -489,11 +482,6 @@ int l23_app_init(void)
 	l23_app_work = _mobile_app_work;
 	l23_app_exit = _mobile_app_exit;
 	osmo_gps_init();
-
-#ifdef WITH_GAPK_IO
-	/* Init GAPK audio I/O */
-	gapk_io_init();
-#endif
 
 	osmo_signal_register_handler(SS_GLOBAL, &global_signal_cb, NULL);
 	osmo_signal_register_handler(SS_L1CTL, &mobile_signal_cb, NULL);

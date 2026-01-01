@@ -22,16 +22,20 @@
 #include <stdlib.h>
 
 #include <osmocom/core/msgb.h>
+#include <osmocom/core/signal.h>
+#include <osmocom/core/talloc.h>
+
+#include <osmocom/gsm/protocol/gsm_04_80.h>
+#include <osmocom/gsm/gsm48.h>
+
 #include <osmocom/bb/common/logging.h>
 #include <osmocom/bb/common/osmocom_data.h>
 #include <osmocom/bb/common/ms.h>
 #include <osmocom/bb/mobile/mncc.h>
 #include <osmocom/bb/mobile/transaction.h>
 #include <osmocom/bb/mobile/gsm480_ss.h>
-#include <osmocom/core/talloc.h>
+#include <osmocom/bb/mobile/gsm44068_gcc_bcc.h>
 #include <osmocom/bb/mobile/vty.h>
-#include <osmocom/gsm/protocol/gsm_04_80.h>
-#include <osmocom/gsm/gsm48.h>
 
 static uint32_t new_callref = 0x80000001;
 
@@ -224,7 +228,7 @@ static int gsm480_ss_result(struct osmocom_ms *ms, const char *response,
 	return 0;
 }
 
-enum {
+enum gsm480_ss_state {
 	GSM480_SS_ST_IDLE = 0,
 	GSM480_SS_ST_REGISTER,
 	GSM480_SS_ST_ACTIVE,
@@ -293,6 +297,13 @@ static int gsm480_trans_free(struct gsm_trans *trans)
 	trans_free(trans);
 
 	return 0;
+}
+
+static void gsm480_trans_state_chg(struct gsm_trans *trans,
+				   enum gsm480_ss_state state)
+{
+	trans->ss.state = state;
+	osmo_signal_dispatch(SS_L23_TRANS, S_L23_CC_TRANS_STATE_CHG, trans);
 }
 
 /*
@@ -615,6 +626,12 @@ int ss_send(struct osmocom_ms *ms, const char *code, int new_trans)
 		return -EIO;
 	}
 
+	/* ASCI call does not allow other transactions */
+	if (trans_find_ongoing_gcc_bcc(ms)) {
+		gsm480_ss_result(ms, "<ongoing ASCI call>", 0);
+		return -EBUSY;
+	}
+
 	/* allocate transaction with dummy reference */
 	transaction_id = trans_assign_trans_id(ms, GSM48_PDISC_NC_SS,
 		0);
@@ -633,8 +650,7 @@ int ss_send(struct osmocom_ms *ms, const char *code, int new_trans)
 		return -ENOMEM;
 	}
 
-	/* go register sent state */
-	trans->ss.state = GSM480_SS_ST_REGISTER;
+	gsm480_trans_state_chg(trans, GSM480_SS_ST_REGISTER);
 
 	/* FIXME: generate invoke ID */
 	trans->ss.invoke_id = 5;
@@ -1071,7 +1087,12 @@ static int gsm480_rx_release_comp(struct gsm_trans *trans, struct msgb *msg)
 	struct tlv_parsed tp;
 	int rc = 0;
 
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DSS, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		gsm480_trans_free(trans);
+		return -EINVAL;
+	}
+
 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
 		rc = gsm480_rx_fac_ie(trans, TLVP_VAL(&tp, GSM48_IE_FACILITY),
 			*(TLVP_VAL(&tp, GSM48_IE_FACILITY)-1));
@@ -1104,11 +1125,15 @@ static int gsm480_rx_facility(struct gsm_trans *trans, struct msgb *msg)
 	struct tlv_parsed tp;
 	int rc = 0;
 
-	/* go register state */
-	trans->ss.state = GSM480_SS_ST_ACTIVE;
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
+		      GSM48_IE_FACILITY, 0) < 0) {
+		LOGP(DSS, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		/* XXX: indicate an error somehow */
+		return -EINVAL;
+	}
 
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
-		GSM48_IE_FACILITY, 0);
+	gsm480_trans_state_chg(trans, GSM480_SS_ST_ACTIVE);
+
 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
 		rc = gsm480_rx_fac_ie(trans, TLVP_VAL(&tp, GSM48_IE_FACILITY),
 			*(TLVP_VAL(&tp, GSM48_IE_FACILITY)-1));
@@ -1136,10 +1161,14 @@ static int gsm480_rx_register(struct gsm_trans *trans, struct msgb *msg)
 	struct tlv_parsed tp;
 	int rc = 0;
 
-	/* go register state */
-	trans->ss.state = GSM480_SS_ST_ACTIVE;
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DSS, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		/* XXX: indicate an error somehow */
+		return -EINVAL;
+	}
 
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
+	gsm480_trans_state_chg(trans, GSM480_SS_ST_ACTIVE);
+
 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
 		rc = gsm480_rx_fac_ie(trans, TLVP_VAL(&tp, GSM48_IE_FACILITY),
 			*(TLVP_VAL(&tp, GSM48_IE_FACILITY)-1));
@@ -1256,7 +1285,7 @@ int gsm480_rcv_ss(struct osmocom_ms *ms, struct msgb *msg)
 	struct gsm_trans *trans;
 	int rc = 0;
 
-	trans = trans_find_by_callref(ms, mmh->ref);
+	trans = trans_find_by_callref(ms, GSM48_PDISC_NC_SS, mmh->ref);
 	if (!trans) {
 		LOGP(DSS, LOGL_INFO, " -> (new transaction)\n");
 		trans = trans_alloc(ms, GSM48_PDISC_NC_SS, mmh->transaction_id,

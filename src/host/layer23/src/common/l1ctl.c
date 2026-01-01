@@ -317,6 +317,7 @@ static int rx_ph_data_ind(struct osmocom_ms *ms, struct msgb *msg)
 			PRIM_OP_INDICATION, msg);
 	pp.u.data.chan_nr = dl->chan_nr;
 	pp.u.data.link_id = dl->link_id;
+	pp.u.data.fn = tm.fn;
 
 	/* send it up into LAPDm */
 	return lapdm_phsap_up(&pp.oph, le);
@@ -442,8 +443,8 @@ int l1ctl_tx_ccch_mode_req(struct osmocom_ms *ms, uint8_t ccch_mode)
 }
 
 /* Transmit L1CTL_TCH_MODE_REQ */
-int l1ctl_tx_tch_mode_req(struct osmocom_ms *ms, uint8_t tch_mode,
-			  uint8_t audio_mode, uint8_t tch_loop_mode)
+int l1ctl_tx_tch_mode_req(struct osmocom_ms *ms, uint8_t tch_mode, uint8_t audio_mode, uint8_t tch_flags,
+			  uint8_t tch_loop_mode)
 {
 	struct msgb *msg;
 	struct l1ctl_tch_mode_req *req;
@@ -457,6 +458,7 @@ int l1ctl_tx_tch_mode_req(struct osmocom_ms *ms, uint8_t tch_mode,
 	req = (struct l1ctl_tch_mode_req *) msgb_put(msg, sizeof(*req));
 	req->tch_mode = tch_mode;
 	req->audio_mode = audio_mode;
+	req->tch_flags = tch_flags;
 	req->tch_loop_mode = tch_loop_mode;
 	/* TODO: Set AMR codec in req if req->tch_mode==GSM48_CMODE_SPEECH_AMR */
 
@@ -512,7 +514,7 @@ int l1ctl_tx_crypto_req(struct osmocom_ms *ms, uint8_t chan_nr,
 /* Transmit L1CTL_RACH_REQ */
 int l1ctl_tx_rach_req(struct osmocom_ms *ms,
 		      uint8_t chan_nr, uint8_t link_id,
-		      uint8_t ra, uint16_t offset, uint8_t combined)
+		      uint8_t ra, uint16_t offset, uint8_t combined, uint8_t uic)
 {
 	struct msgb *msg;
 	struct l1ctl_info_ul *ul;
@@ -522,7 +524,7 @@ int l1ctl_tx_rach_req(struct osmocom_ms *ms,
 	if (!msg)
 		return -1;
 
-	DEBUGP(DL1C, "RACH Req. offset=%d combined=%d\n", offset, combined);
+	DEBUGP(DL1C, "RACH Req. offset=%d combined=%d uic=0x%02x\n", offset, combined, uic);
 	ul = (struct l1ctl_info_ul *) msgb_put(msg, sizeof(*ul));
 	ul->chan_nr = chan_nr;
 	ul->link_id = link_id;
@@ -530,14 +532,14 @@ int l1ctl_tx_rach_req(struct osmocom_ms *ms,
 	req->ra = ra;
 	req->offset = htons(offset);
 	req->combined = combined;
+	req->uic = uic;
 
 	return osmo_send_l1(ms, msg);
 }
 
 /* Transmit L1CTL_DM_EST_REQ */
-int l1ctl_tx_dm_est_req_h0(struct osmocom_ms *ms, uint16_t band_arfcn,
-                           uint8_t chan_nr, uint8_t tsc, uint8_t tch_mode,
-			   uint8_t audio_mode)
+int l1ctl_tx_dm_est_req_h0(struct osmocom_ms *ms, uint16_t band_arfcn, uint8_t chan_nr, uint8_t tsc, uint8_t tch_mode,
+			   uint8_t audio_mode, uint8_t tch_flags)
 {
 	struct msgb *msg;
 	struct l1ctl_info_ul *ul;
@@ -560,14 +562,13 @@ int l1ctl_tx_dm_est_req_h0(struct osmocom_ms *ms, uint16_t band_arfcn,
 	req->h0.band_arfcn = htons(band_arfcn);
 	req->tch_mode = tch_mode;
 	req->audio_mode = audio_mode;
+	req->tch_flags = tch_flags;
 
 	return osmo_send_l1(ms, msg);
 }
 
-int l1ctl_tx_dm_est_req_h1(struct osmocom_ms *ms, uint8_t maio, uint8_t hsn,
-                           uint16_t *ma, uint8_t ma_len,
-                           uint8_t chan_nr, uint8_t tsc, uint8_t tch_mode,
-			   uint8_t audio_mode)
+int l1ctl_tx_dm_est_req_h1(struct osmocom_ms *ms, uint8_t maio, uint8_t hsn, uint16_t *ma, uint8_t ma_len,
+			   uint8_t chan_nr, uint8_t tsc, uint8_t tch_mode, uint8_t audio_mode, uint8_t tch_flags)
 {
 	struct msgb *msg;
 	struct l1ctl_info_ul *ul;
@@ -595,6 +596,7 @@ int l1ctl_tx_dm_est_req_h1(struct osmocom_ms *ms, uint8_t maio, uint8_t hsn,
 		req->h1.ma[i] = htons(ma[i]);
 	req->tch_mode = tch_mode;
 	req->audio_mode = audio_mode;
+	req->tch_flags = tch_flags;
 
 	return osmo_send_l1(ms, msg);
 }
@@ -830,6 +832,7 @@ static int rx_l1_tch_mode_conf(struct osmocom_ms *ms, struct msgb *msg)
 
 	mc.tch_mode = conf->tch_mode;
 	mc.audio_mode = conf->audio_mode;
+	mc.tch_flags = conf->tch_flags;
 	mc.ms = ms;
 	osmo_signal_dispatch(SS_L1CTL, S_L1CTL_TCH_MODE_CONF, &mc);
 
@@ -841,7 +844,6 @@ static int rx_l1_traffic_ind(struct osmocom_ms *ms, struct msgb *msg)
 {
 	struct l1ctl_info_dl *dl;
 	struct l1ctl_traffic_ind *ti;
-	size_t frame_len;
 	uint8_t *frame;
 
 	if (msgb_l1len(msg) < sizeof(*dl)) {
@@ -858,11 +860,8 @@ static int rx_l1_traffic_ind(struct osmocom_ms *ms, struct msgb *msg)
 	msg->l2h = dl->payload;
 	msg->l3h = frame;
 
-	/* Calculate the frame length */
-	frame_len = msgb_l3len(msg);
-
-	DEBUGP(DL1C, "TRAFFIC IND len=%zu (%s)\n", frame_len,
-		osmo_hexdump(frame, frame_len));
+	LOGP(DL1C, LOGL_DEBUG, "Rx TRAFFIC.ind (fn=%u, chan_nr=0x%02x, len=%u): %s\n",
+	     ntohl(dl->frame_nr), dl->chan_nr, msgb_l3len(msg), msgb_hexdump_l3(msg));
 
 	/* distribute or drop */
 	if (ms->l1_entity.l1_traffic_ind)
@@ -879,7 +878,6 @@ int l1ctl_tx_traffic_req(struct osmocom_ms *ms, struct msgb *msg,
 	struct l1ctl_hdr *l1h;
 	struct l1ctl_info_ul *l1i_ul;
 	struct l1ctl_traffic_req *tr;
-	size_t frame_len;
 	uint8_t *frame;
 
 	/* Header handling */
@@ -887,11 +885,8 @@ int l1ctl_tx_traffic_req(struct osmocom_ms *ms, struct msgb *msg,
 	frame = (uint8_t *) tr->data;
 	msg->l3h = frame;
 
-	/* Calculate the frame length */
-	frame_len = msgb_l3len(msg);
-
-	DEBUGP(DL1C, "TRAFFIC REQ len=%zu (%s)\n", frame_len,
-		osmo_hexdump(frame, frame_len));
+	LOGP(DL1C, LOGL_DEBUG, "Tx TRAFFIC.req (chan_nr=0x%02x, len=%u): %s\n",
+	     chan_nr, msgb_l3len(msg), msgb_hexdump_l3(msg));
 
 	/* prepend uplink info header */
 	l1i_ul = (struct l1ctl_info_ul *) msgb_push(msg, sizeof(*l1i_ul));
@@ -954,10 +949,42 @@ static int rx_l1_neigh_pm_ind(struct osmocom_ms *ms, struct msgb *msg)
 	return 0;
 }
 
+/* Receive L1CTL_GPRS_UL_BLOCK_CNF */
+static int rx_l1_gprs_ul_block_cnf(struct osmocom_ms *ms, struct msgb *msg)
+{
+	const struct l1ctl_gprs_ul_block_cnf *cnf = (void *)msg->l1h;
+
+	if (msgb_l1len(msg) < sizeof(*cnf)) {
+		LOGP(DL1C, LOGL_ERROR,
+		     "Rx malformed GPRS UL BLOCK.cnf (len=%u < %zu)\n",
+		     msgb_l1len(msg), sizeof(*cnf));
+		return -EINVAL;
+	}
+	if (OSMO_UNLIKELY(cnf->tn >= 8)) {
+		LOGP(DL1C, LOGL_ERROR,
+		     "Rx malformed GPRS UL BLOCK.cnf (tn=%u)\n", cnf->tn);
+		return -EINVAL;
+	}
+
+	msg->l2h = (void *)&cnf->data[0];
+
+	DEBUGP(DL1C, "Rx GPRS UL BLOCK.cnf (fn=%u, tn=%u, len=%u): %s\n",
+	       ntohl(cnf->fn), cnf->tn, msgb_l2len(msg), msgb_hexdump_l2(msg));
+
+	/* distribute or drop */
+	if (ms->l1_entity.l1_gprs_ul_block_cnf)
+		return ms->l1_entity.l1_gprs_ul_block_cnf(ms, msg);
+
+	msgb_free(msg);
+	return 0;
+}
+
 /* Receive L1CTL_GPRS_DL_BLOCK_IND */
 static int rx_l1_gprs_dl_block_ind(struct osmocom_ms *ms, struct msgb *msg)
 {
 	const struct l1ctl_gprs_dl_block_ind *ind = (void *)msg->l1h;
+	uint8_t gsmtap_chan;
+	uint32_t fn;
 
 	if (msgb_l1len(msg) < sizeof(*ind)) {
 		LOGP(DL1C, LOGL_ERROR,
@@ -974,12 +1001,53 @@ static int rx_l1_gprs_dl_block_ind(struct osmocom_ms *ms, struct msgb *msg)
 
 	msg->l2h = (void *)&ind->data[0];
 
-	DEBUGP(DL1C, "Rx GPRS DL block (fn=%u, tn=%u, len=%u): %s\n",
-	       ntohl(ind->hdr.fn), ind->hdr.tn, msgb_l2len(msg), msgb_hexdump_l2(msg));
+	fn = ntohl(ind->hdr.fn);
+	if ((fn % 104) == 12)
+		gsmtap_chan = GSMTAP_CHANNEL_PTCCH;
+	else
+		gsmtap_chan = GSMTAP_CHANNEL_PDTCH;
+
+	gsmtap_send(l23_cfg.gsmtap.inst,
+		    ms->rrlayer.cd_now.arfcn,
+		    ind->hdr.tn, gsmtap_chan, 0, fn,
+		    rxlev2dbm(ind->meas.rx_lev), 0,
+		    msgb_l2(msg), msgb_l2len(msg));
+
+	DEBUGP(DL1C, "Rx GPRS DL BLOCK.ind (fn=%u, tn=%u, len=%u): %s\n",
+	       fn, ind->hdr.tn, msgb_l2len(msg), msgb_hexdump_l2(msg));
 
 	/* distribute or drop */
 	if (ms->l1_entity.l1_gprs_dl_block_ind)
 		return ms->l1_entity.l1_gprs_dl_block_ind(ms, msg);
+
+	msgb_free(msg);
+	return 0;
+}
+
+/* Receive L1CTL_GPRS_RTS_IND */
+static int rx_l1_gprs_rts_ind(struct osmocom_ms *ms, struct msgb *msg)
+{
+	const struct l1ctl_gprs_rts_ind *ind = (void *)msg->l1h;
+
+	if (msgb_l1len(msg) < sizeof(*ind)) {
+		LOGP(DL1C, LOGL_ERROR,
+		     "Rx malformed GPRS RTS.ind (len=%u < %zu)\n",
+		     msgb_l1len(msg), sizeof(*ind));
+		return -EINVAL;
+	}
+	if (OSMO_UNLIKELY(ind->tn >= 8)) {
+		LOGP(DL1C, LOGL_ERROR,
+		     "Rx malformed GPRS RTS.ind (tn=%u)\n",
+		     ind->tn);
+		return -EINVAL;
+	}
+
+	DEBUGP(DL1C, "Rx GPRS RTS.ind (fn=%u, tn=%u, usf=%u)\n",
+	       ntohl(ind->fn), ind->tn, ind->usf);
+
+	/* distribute or drop */
+	if (ms->l1_entity.l1_gprs_rts_ind)
+		return ms->l1_entity.l1_gprs_rts_ind(ms, msg);
 
 	msgb_free(msg);
 	return 0;
@@ -1005,12 +1073,17 @@ int l1ctl_tx_gprs_ul_block_req(struct osmocom_ms *ms, uint32_t fn, uint8_t tn,
 	DEBUGP(DL1C, "Tx GPRS UL block (fn=%u, tn=%u, len=%zu): %s\n",
 	       fn, tn, data_len, osmo_hexdump(data, data_len));
 
+	gsmtap_send(l23_cfg.gsmtap.inst,
+		    ms->rrlayer.cd_now.arfcn | GSMTAP_ARFCN_F_UPLINK,
+		    tn, GSMTAP_CHANNEL_PDTCH, 0, fn, 127, 0,
+		    data, data_len);
+
 	return osmo_send_l1(ms, msg);
 }
 
 /* Transmit L1CTL_GPRS_UL_TBF_CFG_REQ */
 int l1ctl_tx_gprs_ul_tbf_cfg_req(struct osmocom_ms *ms, uint8_t tbf_ref,
-				 uint8_t slotmask)
+				 uint8_t slotmask, uint32_t start_fn)
 {
 	struct l1ctl_gprs_ul_tbf_cfg_req *req;
 	struct msgb *msg;
@@ -1023,17 +1096,20 @@ int l1ctl_tx_gprs_ul_tbf_cfg_req(struct osmocom_ms *ms, uint8_t tbf_ref,
 	*req = (struct l1ctl_gprs_ul_tbf_cfg_req) {
 		.tbf_ref = tbf_ref,
 		.slotmask = slotmask,
+		.start_fn = htonl(start_fn),
 	};
 
-	DEBUGP(DL1C, "Tx GPRS UL TBF CFG (tbf_ref=%u, slotmask=0x%02x)\n",
-	       tbf_ref, slotmask);
+	DEBUGP(DL1C, "Tx GPRS UL TBF CFG: "
+	       "tbf_ref=%u, slotmask=0x%02x, start_fn=%u\n",
+	       tbf_ref, slotmask, start_fn);
 
 	return osmo_send_l1(ms, msg);
 }
 
 /* Transmit L1CTL_GPRS_DL_TBF_CFG_REQ */
 int l1ctl_tx_gprs_dl_tbf_cfg_req(struct osmocom_ms *ms, uint8_t tbf_ref,
-				 uint8_t slotmask, uint8_t dl_tfi)
+				 uint8_t slotmask, uint32_t start_fn,
+				 uint8_t dl_tfi)
 {
 	struct l1ctl_gprs_dl_tbf_cfg_req *req;
 	struct msgb *msg;
@@ -1046,11 +1122,13 @@ int l1ctl_tx_gprs_dl_tbf_cfg_req(struct osmocom_ms *ms, uint8_t tbf_ref,
 	*req = (struct l1ctl_gprs_dl_tbf_cfg_req) {
 		.tbf_ref = tbf_ref,
 		.slotmask = slotmask,
+		.start_fn = htonl(start_fn),
 		.dl_tfi = dl_tfi,
 	};
 
-	DEBUGP(DL1C, "Tx GPRS DL TBF CFG (tbf_ref=%u, slotmask=0x%02x, dl_tfi=%u)\n",
-	       tbf_ref, slotmask, dl_tfi);
+	DEBUGP(DL1C, "Tx GPRS DL TBF CFG: "
+	       "tbf_ref=%u, slotmask=0x%02x, start_fn=%u, dl_tfi=%u)\n",
+	       tbf_ref, slotmask, start_fn, dl_tfi);
 
 	return osmo_send_l1(ms, msg);
 }
@@ -1123,8 +1201,14 @@ int l1ctl_recv(struct osmocom_ms *ms, struct msgb *msg)
 	case L1CTL_TRAFFIC_CONF:
 		msgb_free(msg);
 		break;
+	case L1CTL_GPRS_UL_BLOCK_CNF:
+		rc = rx_l1_gprs_ul_block_cnf(ms, msg);
+		break;
 	case L1CTL_GPRS_DL_BLOCK_IND:
 		rc = rx_l1_gprs_dl_block_ind(ms, msg);
+		break;
+	case L1CTL_GPRS_RTS_IND:
+		rc = rx_l1_gprs_rts_ind(ms, msg);
 		break;
 	default:
 		LOGP(DL1C, LOGL_ERROR, "Unknown MSG: %u\n", hdr->msg_type);

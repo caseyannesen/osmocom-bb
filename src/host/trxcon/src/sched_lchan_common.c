@@ -78,13 +78,12 @@ const uint8_t l1sched_nb_training_bits[8][26] = {
  * Examples: "  ****.." (incomplete, 4/6 bursts)
  *           "    ****" (complete, all 4 bursts)
  *           "**.***.." (incomplete, 5/8 bursts) */
-const char *l1sched_burst_mask2str(const uint8_t *mask, int bits)
+const char *l1sched_burst_mask2str(const uint32_t *mask, int bits)
 {
-	/* TODO: CSD is interleaved over 22 bursts, so the mask needs to be extended */
-	static char buf[8 + 1];
+	static char buf[32 + 1];
 	char *ptr = buf;
 
-	OSMO_ASSERT(bits <= 8 && bits > 0);
+	OSMO_ASSERT(bits <= 32 && bits > 0);
 
 	while (--bits >= 0)
 		*(ptr++) = (*mask & (1 << bits)) ? '*' : '.';
@@ -93,17 +92,18 @@ const char *l1sched_burst_mask2str(const uint8_t *mask, int bits)
 	return buf;
 }
 
-bool l1sched_lchan_amr_prim_is_valid(struct l1sched_lchan_state *lchan, bool is_cmr)
+bool l1sched_lchan_amr_prim_is_valid(struct l1sched_lchan_state *lchan,
+				     struct msgb *msg, bool is_cmr)
 {
 	enum osmo_amr_type ft_codec;
 	uint8_t cmr_codec;
 	int ft, cmr, len;
 
-	len = osmo_amr_rtp_dec(msgb_l2(lchan->prim), msgb_l2len(lchan->prim),
+	len = osmo_amr_rtp_dec(msgb_l2(msg), msgb_l2len(msg),
 			       &cmr_codec, NULL, &ft_codec, NULL, NULL);
 	if (len < 0) {
 		LOGP_LCHAND(lchan, LOGL_ERROR, "Cannot send invalid AMR payload (%u): %s\n",
-			    msgb_l2len(lchan->prim), msgb_hexdump_l2(lchan->prim));
+			    msgb_l2len(msg), msgb_hexdump_l2(msg));
 		return false;
 	}
 	ft = -1;

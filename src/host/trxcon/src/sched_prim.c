@@ -36,7 +36,7 @@
 #include <osmocom/bb/l1sched/logging.h>
 
 #define L1SCHED_PRIM_HEADROOM	64
-#define L1SCHED_PRIM_TAILROOM	64
+#define L1SCHED_PRIM_TAILROOM	512
 
 osmo_static_assert(sizeof(struct l1sched_prim) <= L1SCHED_PRIM_HEADROOM, l1sched_prim_size);
 
@@ -94,7 +94,7 @@ static struct msgb *prim_compose_mr(struct l1sched_lchan_state *lchan)
 
 	prim = l1sched_prim_from_msgb(msg);
 	prim->data_req = (struct l1sched_prim_chdr) {
-		.chan_nr = l1sched_lchan_desc[lchan->type].chan_nr,
+		.chan_nr = l1sched_lchan_desc[lchan->type].chan_nr | lchan->ts->index,
 		.link_id = L1SCHED_CH_LID_SACCH,
 	};
 
@@ -249,17 +249,6 @@ struct msgb *l1sched_lchan_prim_dequeue_tch(struct l1sched_lchan_state *lchan, b
 }
 
 /**
- * Drops the current primitive of specified logical channel
- *
- * @param lchan a logical channel to drop prim from
- */
-void l1sched_lchan_prim_drop(struct l1sched_lchan_state *lchan)
-{
-	msgb_free(lchan->prim);
-	lchan->prim = NULL;
-}
-
-/**
  * Allocate a DATA.req with dummy LAPDm func=UI frame for the given logical channel.
  * To be used when no suitable DATA.req is present in the Tx queue.
  *
@@ -343,15 +332,13 @@ int l1sched_lchan_emit_data_ind(struct l1sched_lchan_state *lchan,
 	return l1sched_prim_to_user(lchan->ts->sched, msg);
 }
 
-int l1sched_lchan_emit_data_cnf(struct l1sched_lchan_state *lchan, uint32_t fn)
+int l1sched_lchan_emit_data_cnf(struct l1sched_lchan_state *lchan,
+				struct msgb *msg, uint32_t fn)
 {
 	struct l1sched_prim *prim;
-	struct msgb *msg;
 
-	/* take ownership of the prim */
-	if ((msg = lchan->prim) == NULL)
+	if (msg == NULL)
 		return -ENODEV;
-	lchan->prim = NULL;
 
 	/* convert from DATA.req to DATA.cnf */
 	prim = l1sched_prim_from_msgb(msg);
@@ -382,9 +369,9 @@ static int prim_enqeue(struct l1sched_state *sched, struct msgb *msg,
 	if (OSMO_UNLIKELY(lchan == NULL || !lchan->active)) {
 		LOGP_SCHEDD(sched, LOGL_ERROR,
 			    "No [active] lchan for primitive " L1SCHED_PRIM_STR_FMT " "
-			    "(chan_nr=%02x, link_id=%02x, len=%u): %s\n",
+			    "(fn=%u, chan_nr=0x%02x, link_id=0x%02x, len=%u): %s\n",
 			    L1SCHED_PRIM_STR_ARGS(prim),
-			    chdr->chan_nr, chdr->link_id,
+			    chdr->frame_nr, chdr->chan_nr, chdr->link_id,
 			    msgb_l2len(msg), msgb_hexdump_l2(msg));
 		msgb_free(msg);
 		return -ENODEV;
@@ -392,9 +379,9 @@ static int prim_enqeue(struct l1sched_state *sched, struct msgb *msg,
 
 	LOGP_LCHAND(lchan, LOGL_DEBUG,
 		    "Enqueue primitive " L1SCHED_PRIM_STR_FMT " "
-		    "(chan_nr=%02x, link_id=%02x, len=%u): %s\n",
+		    "(fn=%u, chan_nr=0x%02x, link_id=0x%02x, len=%u): %s\n",
 		    L1SCHED_PRIM_STR_ARGS(prim),
-		    chdr->chan_nr, chdr->link_id,
+		    chdr->frame_nr, chdr->chan_nr, chdr->link_id,
 		    msgb_l2len(msg), msgb_hexdump_l2(msg));
 
 	msgb_enqueue(&lchan->tx_prims, msg);

@@ -34,6 +34,7 @@
 #include <osmocom/bb/mobile/mncc.h>
 #include <osmocom/bb/mobile/transaction.h>
 #include <osmocom/bb/mobile/gsm411_sms.h>
+#include <osmocom/bb/mobile/gsm44068_gcc_bcc.h>
 #include <osmocom/gsm/gsm0411_utils.h>
 #include <osmocom/core/talloc.h>
 #include <osmocom/bb/mobile/vty.h>
@@ -651,6 +652,14 @@ int gsm411_tx_sms_submit(struct osmocom_ms *ms, const char *sms_sca,
 		return -EIO;
 	}
 
+	/* ASCI call does not allow other transactions */
+	if (trans_find_ongoing_gcc_bcc(ms)) {
+		LOGP(DLSMS, LOGL_ERROR, "Phone is busy doing ASCI call\n");
+		gsm411_sms_report(ms, sms, GSM411_RP_CAUSE_MO_TEMP_FAIL);
+		sms_free(sms);
+		return -EIO;
+	}
+
 	/* allocate transaction with dummy reference */
 	transaction_id = trans_assign_trans_id(ms, GSM48_PDISC_SMS, 0);
 	if (transaction_id < 0) {
@@ -914,7 +923,7 @@ int gsm411_rcv_sms(struct osmocom_ms *ms, struct msgb *msg)
 	struct gsm_trans *trans;
 	int rc = 0;
 
-	trans = trans_find_by_callref(ms, mmh->ref);
+	trans = trans_find_by_callref(ms, GSM48_PDISC_SMS, mmh->ref);
 	if (!trans) {
 		LOGP(DLSMS, LOGL_INFO, " -> (new transaction sapi=%d)\n", sapi);
 		trans = trans_alloc(ms, GSM48_PDISC_SMS, mmh->transaction_id,

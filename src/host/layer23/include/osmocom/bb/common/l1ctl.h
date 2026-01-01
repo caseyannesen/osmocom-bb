@@ -23,14 +23,13 @@ int l1ctl_tx_crypto_req(struct osmocom_ms *ms, uint8_t chan_nr,
 /* Transmit L1CTL_RACH_REQ */
 int l1ctl_tx_rach_req(struct osmocom_ms *ms,
 		      uint8_t chan_nr, uint8_t link_id,
-		      uint8_t ra, uint16_t offset, uint8_t combined);
+		      uint8_t ra, uint16_t offset, uint8_t combined, uint8_t uic);
 
 /* Transmit L1CTL_DM_EST_REQ */
-int l1ctl_tx_dm_est_req_h0(struct osmocom_ms *ms, uint16_t band_arfcn,
-	uint8_t chan_nr, uint8_t tsc, uint8_t tch_mode, uint8_t audio_mode);
-int l1ctl_tx_dm_est_req_h1(struct osmocom_ms *ms, uint8_t maio, uint8_t hsn,
-	uint16_t *ma, uint8_t ma_len, uint8_t chan_nr, uint8_t tsc,
-	uint8_t tch_mode, uint8_t audio_mode);
+int l1ctl_tx_dm_est_req_h0(struct osmocom_ms *ms, uint16_t band_arfcn, uint8_t chan_nr, uint8_t tsc,
+			   uint8_t tch_mode, uint8_t audio_mode, uint8_t tch_flags);
+int l1ctl_tx_dm_est_req_h1(struct osmocom_ms *ms, uint8_t maio, uint8_t hsn, uint16_t *ma, uint8_t ma_len,
+			   uint8_t chan_nr, uint8_t tsc, uint8_t tch_mode, uint8_t audio_mode, uint8_t tch_flags);
 
 /* Transmit L1CTL_DM_FREQ_REQ */
 int l1ctl_tx_dm_freq_req_h0(struct osmocom_ms *ms, uint16_t band_arfcn,
@@ -50,8 +49,8 @@ int l1ctl_tx_fbsb_req(struct osmocom_ms *ms, uint16_t arfcn,
 int l1ctl_tx_ccch_mode_req(struct osmocom_ms *ms, uint8_t ccch_mode);
 
 /* Transmit TCH_MODE_REQ */
-int l1ctl_tx_tch_mode_req(struct osmocom_ms *ms, uint8_t tch_mode,
-			  uint8_t audio_mode, uint8_t tch_loop_mode);
+int l1ctl_tx_tch_mode_req(struct osmocom_ms *ms, uint8_t tch_mode, uint8_t audio_mode, uint8_t tch_flags,
+			  uint8_t tch_loop_mode);
 
 /* Transmit ECHO_REQ */
 int l1ctl_tx_echo_req(struct osmocom_ms *ms, unsigned int len);
@@ -81,10 +80,11 @@ int l1ctl_tx_gprs_ul_block_req(struct osmocom_ms *ms, uint32_t fn, uint8_t tn,
 
 /* Transmit L1CTL_GPRS_UL_TBF_CFG_REQ */
 int l1ctl_tx_gprs_ul_tbf_cfg_req(struct osmocom_ms *ms, uint8_t tbf_ref,
-				 uint8_t slotmask);
+				 uint8_t slotmask, uint32_t start_fn);
 
 /* Transmit L1CTL_GPRS_DL_TBF_CFG_REQ */
 int l1ctl_tx_gprs_dl_tbf_cfg_req(struct osmocom_ms *ms, uint8_t tbf_ref,
-				 uint8_t slotmask, uint8_t dl_tfi);
+				 uint8_t slotmask, uint32_t start_fn,
+				 uint8_t dl_tfi);
 
 #endif

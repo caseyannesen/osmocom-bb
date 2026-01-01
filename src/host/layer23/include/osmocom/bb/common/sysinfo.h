@@ -18,12 +18,27 @@
 #define	FREQ_TYPE_REP_5bis	0x40 /* sub channel of SI 5bis */
 #define	FREQ_TYPE_REP_5ter	0x80 /* sub channel of SI 5ter */
 
+struct si10_cell_info {
+	uint8_t				index; /* frequency index of the frequencies received in SI5* */
+	int16_t				arfcn; /* ARFCN or -1 (if not found in SI5*) */
+	uint8_t				bsic;
+	bool				barred; /* Cell is barred, values below are invalid. */
+	bool				la_different; /* Location area is different, so CRH is valid. */
+	uint8_t				cell_resel_hyst_db;
+	uint8_t				ms_txpwr_max_cch;
+	uint8_t				rxlev_acc_min_db;
+	uint8_t				cell_resel_offset;
+	uint8_t				temp_offset;
+	uint8_t				penalty_time;
+};
+
 /* structure of all received system information */
 struct gsm48_sysinfo {
 	/* flags of available information */
 	uint8_t				si1, si2, si2bis, si2ter, si3,
 					si4, si5, si5bis, si5ter, si6,
 					si13;
+	bool				si10;
 
 	/* memory maps to simply detect change in system info messages */
 	uint8_t				si1_msg[23];
@@ -36,6 +51,7 @@ struct gsm48_sysinfo {
 	uint8_t				si5b_msg[18];
 	uint8_t				si5t_msg[18];
 	uint8_t				si6_msg[18];
+	uint8_t				si10_msg[21];
 	uint8_t				si13_msg[23];
 
 	struct	gsm_sysinfo_freq	freq[1024]; /* all frequencies */
@@ -55,7 +71,7 @@ struct gsm48_sysinfo {
 	/* si1 rest */
 	uint8_t				nch;
 	uint8_t				nch_position;
-	uint8_t				band_ind; /* set for DCS */
+	bool				band_ind; /* set for DCS */
 
 	/* si3 rest */
 	uint8_t				sp;
@@ -158,13 +174,19 @@ struct gsm48_sysinfo {
 	uint8_t				nb_reest_denied; /* 1 = denied */
 	uint8_t				nb_cell_barr; /* 1 = barred */
 	uint16_t			nb_class_barr; /* bit 10 is emergency */
+
+	/* SI 10 */
+	uint8_t				si10_cell_num; /* number neighbor cells found in SI 10 */
+	struct si10_cell_info		si10_cell[32];	/* 32 neighbor cell descriptions */
 };
 
 char *gsm_print_arfcn(uint16_t arfcn);
-uint8_t gsm_refer_pcs(uint16_t arfcn, const struct gsm48_sysinfo *s);
+bool gsm_refer_pcs(uint16_t cell_arfcn, const struct gsm48_sysinfo *cell_s);
+uint16_t gsm_arfcn_refer_pcs(uint16_t cell_arfcn, const struct gsm48_sysinfo *cell_s, uint16_t arfcn);
 int gsm48_sysinfo_dump(const struct gsm48_sysinfo *s, uint16_t arfcn,
 		       void (*print)(void *, const char *, ...),
 		       void *priv, uint8_t *freq_map);
+int gsm48_si10_dump(const struct gsm48_sysinfo *s, void (*print)(void *, const char *, ...), void *priv);
 int gsm48_decode_lai(struct gsm48_loc_area_id *lai, uint16_t *mcc,
 	uint16_t *mnc, uint16_t *lac);
 int gsm48_decode_chan_h0(const struct gsm48_chan_desc *cd,
@@ -191,10 +213,13 @@ int gsm48_decode_sysinfo5ter(struct gsm48_sysinfo *s,
 			     const struct gsm48_system_information_type_5ter *si, int len);
 int gsm48_decode_sysinfo6(struct gsm48_sysinfo *s,
 			  const struct gsm48_system_information_type_6 *si, int len);
+int gsm48_decode_sysinfo10(struct gsm48_sysinfo *s,
+			   const struct gsm48_system_information_type_10 *si, int len);
 int gsm48_decode_sysinfo13(struct gsm48_sysinfo *s,
 			   const struct gsm48_system_information_type_13 *si, int len);
 int gsm48_decode_mobile_alloc(struct gsm_sysinfo_freq *freq,
 			      const uint8_t *ma, uint8_t len,
 			      uint16_t *hopping, uint8_t *hopp_len, int si4);
+int16_t arfcn_from_freq_index(const struct gsm48_sysinfo *s, uint16_t index);
 
 #endif /* _SYSINFO_H */

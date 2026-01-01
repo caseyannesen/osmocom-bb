@@ -34,6 +34,7 @@ char *layer2_socket_path = L2_DEFAULT_SOCKET_PATH;
 
 static char *sap_socket_path = "/tmp/osmocom_sap";
 static char *mncc_socket_path = "/tmp/ms_mncc";
+static char *data_socket_path = "/tmp/ms_data";
 static char *alsa_dev_default = "default";
 
 int gsm_settings_init(struct osmocom_ms *ms)
@@ -48,10 +49,18 @@ int gsm_settings_init(struct osmocom_ms *ms)
 	snprintf(set->mncc_socket_path, sizeof(set->mncc_socket_path) - 1,
 		 "%s_%s", mncc_socket_path, ms->name);
 
-	/* Audio settings: drop TCH frames by default */
-	set->audio.io_handler = AUDIO_IOH_NONE;
-	OSMO_STRLCPY_ARRAY(set->audio.alsa_output_dev, alsa_dev_default);
-	OSMO_STRLCPY_ARRAY(set->audio.alsa_input_dev, alsa_dev_default);
+	/* TCH voice: drop frames by default */
+	set->tch_voice.io_handler = TCH_VOICE_IOH_NONE;
+	set->tch_voice.io_format = TCH_VOICE_IOF_RTP;
+	OSMO_STRLCPY_ARRAY(set->tch_voice.alsa_output_dev, alsa_dev_default);
+	OSMO_STRLCPY_ARRAY(set->tch_voice.alsa_input_dev, alsa_dev_default);
+
+	/* TCH data: drop frames by default */
+	set->tch_data.io_handler = TCH_DATA_IOH_NONE;
+	set->tch_data.io_format = TCH_DATA_IOF_OSMO;
+	snprintf(set->tch_data.unix_socket_path,
+		 sizeof(set->tch_data.unix_socket_path) - 1,
+		 "%s_%s", data_socket_path, ms->name);
 
 	/* Built-in MNCC handler */
 	set->mncc_handler = MNCC_HANDLER_INTERNAL;
@@ -86,6 +95,7 @@ int gsm_settings_init(struct osmocom_ms *ms)
 	set->p_gsm = sup->p_gsm;
 	set->e_gsm = sup->e_gsm;
 	set->r_gsm = sup->r_gsm;
+	set->er_gsm = sup->er_gsm;
 	set->dcs = sup->dcs;
 	set->class_900 = sup->class_900;
 	set->class_dcs = sup->class_dcs;
@@ -101,6 +111,16 @@ int gsm_settings_init(struct osmocom_ms *ms)
 	set->min_rxlev_dbm = sup->min_rxlev_dbm;
 	set->dsc_max = sup->dsc_max;
 
+	set->csd_tch_f144 = sup->csd_tch_f144;
+	set->csd_tch_f96 = sup->csd_tch_f96;
+	set->csd_tch_f48 = sup->csd_tch_f48;
+	set->csd_tch_h48 = sup->csd_tch_h48;
+	set->csd_tch_f24 = sup->csd_tch_f24;
+	set->csd_tch_h24 = sup->csd_tch_h24;
+
+	set->vgcs = sup->vgcs;
+	set->vbs = sup->vbs;
+
 	if (sup->half_v1 || sup->half_v3)
 		set->half = 1;
 
@@ -114,6 +134,19 @@ int gsm_settings_init(struct osmocom_ms *ms)
 
 	INIT_LLIST_HEAD(&set->abbrev);
 	INIT_LLIST_HEAD(&set->multi_imsi_list);
+
+	set->uplink_release_local = true;
+
+	set->call_params.data = (struct data_call_params) {
+		.type_rate = DATA_CALL_TR_V110_9600,
+		.transp = GSM48_BCAP_TR_TRANSP,
+
+		/* async call parameters (8-N-1) */
+		.is_async = true,
+		.nr_stop_bits = 1,
+		.nr_data_bits = 8,
+		.parity = GSM48_BCAP_PAR_NONE,
+	};
 
 	return 0;
 }
@@ -148,9 +181,14 @@ int gsm_settings_arfcn(struct osmocom_ms *ms)
 			set->freq_map[i >> 3] |= (1 << (i & 7));
 		set->freq_map[0] |= 1;
 	}
-	if (set->r_gsm)
-		for(i = 955; i <= 974; i++)
+	if (set->r_gsm) {
+		for (i = 955; i <= 974; i++)
 			set->freq_map[i >> 3] |= (1 << (i & 7));
+	}
+	if (set->er_gsm) {
+		for (i = 940; i <= 954; i++)
+			set->freq_map[i >> 3] |= (1 << (i & 7));
+	}
 
 	return 0;
 }
@@ -215,21 +253,33 @@ int gsm_random_imei(struct gsm_settings *set)
 	return 0;
 }
 
-const struct value_string audio_io_handler_names[] = {
-	{ AUDIO_IOH_NONE,	"none" },
-	{ AUDIO_IOH_GAPK,	"gapk" },
-	{ AUDIO_IOH_L1PHY,	"l1phy" },
-	{ AUDIO_IOH_MNCC_SOCK,	"mncc-sock" },
-	{ AUDIO_IOH_LOOPBACK,	"loopback" },
+const struct value_string tch_voice_io_handler_names[] = {
+	{ TCH_VOICE_IOH_NONE,		"none" },
+	{ TCH_VOICE_IOH_GAPK,		"gapk" },
+	{ TCH_VOICE_IOH_L1PHY,		"l1phy" },
+	{ TCH_VOICE_IOH_MNCC_SOCK,	"mncc-sock" },
+	{ TCH_VOICE_IOH_LOOPBACK,	"loopback" },
 	{ 0, NULL }
 };
 
-const struct value_string audio_io_format_names[] = {
-	{ AUDIO_IOF_RTP,	"rtp" },
-	{ AUDIO_IOF_TI,		"ti" },
+const struct value_string tch_data_io_handler_names[] = {
+	{ TCH_DATA_IOH_NONE,		"none" },
+	{ TCH_DATA_IOH_UNIX_SOCK,	"unix-sock" },
+	{ TCH_DATA_IOH_LOOPBACK,	"loopback" },
 	{ 0, NULL }
 };
 
+const struct value_string tch_voice_io_format_names[] = {
+	{ TCH_VOICE_IOF_RTP,		"rtp" },
+	{ TCH_VOICE_IOF_TI,		"ti" },
+	{ 0, NULL }
+};
+
+const struct value_string tch_data_io_format_names[] = {
+	{ TCH_DATA_IOF_OSMO,		"osmo" },
+	{ TCH_DATA_IOF_TI,		"ti" },
+	{ 0, NULL }
+};
 
 int gprs_settings_init(struct osmocom_ms *ms)
 {

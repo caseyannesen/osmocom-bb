@@ -25,6 +25,7 @@
 #include <osmocom/core/utils.h>
 #include <osmocom/gsm/gsm48.h>
 #include <osmocom/core/talloc.h>
+#include <osmocom/core/signal.h>
 
 #include <osmocom/bb/common/logging.h>
 #include <osmocom/bb/common/osmocom_data.h>
@@ -32,7 +33,8 @@
 #include <osmocom/bb/mobile/mncc.h>
 #include <osmocom/bb/mobile/transaction.h>
 #include <osmocom/bb/mobile/gsm48_cc.h>
-#include <osmocom/bb/mobile/voice.h>
+#include <osmocom/bb/mobile/gsm44068_gcc_bcc.h>
+#include <osmocom/bb/mobile/tch.h>
 #include <l1ctl_proto.h>
 
 static int gsm48_cc_tx_release(struct gsm_trans *trans, void *arg);
@@ -41,6 +43,8 @@ int mncc_release_ind(struct osmocom_ms *ms, struct gsm_trans *trans,
 		     uint32_t callref, int location, int value);
 static int gsm48_cc_tx_disconnect(struct gsm_trans *trans, void *arg);
 static int gsm48_cc_tx_connect_ack(struct gsm_trans *trans, void *arg);
+static void gsm48_cc_trans_bcap_update(struct gsm_trans *trans,
+				       const struct gsm_mncc *mncc);
 
 /*
  * init
@@ -180,10 +184,12 @@ static int gsm48_cc_to_mm(struct msgb *msg, struct gsm_trans *trans,
 
 /* enqueue message to application (MNCC-SAP) */
 static int mncc_recvmsg(struct osmocom_ms *ms, struct gsm_trans *trans,
-       	int msg_type, struct gsm_mncc *mncc)
+			uint32_t msg_type, struct gsm_mncc *mncc)
 {
 	struct gsm48_cclayer *cc = &ms->cclayer;
 	struct msgb *msg;
+
+	gsm48_cc_trans_bcap_update(trans, mncc);
 
 	if (trans)
 		LOGP(DCC, LOGL_INFO, "(ms %s ti %x) Sending '%s' to MNCC.\n",
@@ -238,6 +244,8 @@ static void new_cc_state(struct gsm_trans *trans, int state)
 		gsm48_cc_state_name(state));
 
 	trans->cc.state = state;
+
+	osmo_signal_dispatch(SS_L23_TRANS, S_L23_CC_TRANS_STATE_CHG, trans);
 }
 
 /*
@@ -366,6 +374,9 @@ void _gsm48_cc_trans_free(struct gsm_trans *trans)
 {
 	gsm48_stop_cc_timer(trans);
 
+	talloc_free(trans->cc.bcap);
+	trans->cc.bcap = NULL;
+
 	/* disable audio distribution */
 	if (trans->ms->mncc_entity.ref == trans->callref)
 		trans->ms->mncc_entity.ref = 0;
@@ -379,6 +390,16 @@ void _gsm48_cc_trans_free(struct gsm_trans *trans)
 	}
 	if (trans->cc.state != GSM_CSTATE_NULL)
 		new_cc_state(trans, GSM_CSTATE_NULL);
+}
+
+static void gsm48_cc_trans_bcap_update(struct gsm_trans *trans,
+				       const struct gsm_mncc *mncc)
+{
+	if (~mncc->fields & MNCC_F_BEARER_CAP)
+		return;
+	if (trans->cc.bcap == NULL)
+		trans->cc.bcap = talloc(trans, struct gsm_mncc_bearer_cap);
+	memcpy(trans->cc.bcap, &mncc->bearer_cap, sizeof(mncc->bearer_cap));
 }
 
 /* release MM connection, go NULL state, free transaction */
@@ -622,10 +643,14 @@ static int gsm48_cc_rx_progress(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received PROGRESS\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
+		      GSM48_IE_PROGR_IND, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	memset(&progress, 0, sizeof(struct gsm_mncc));
 	progress.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
-		GSM48_IE_PROGR_IND, 0);
 	/* progress */
 	if (TLVP_PRESENT(&tp, GSM48_IE_PROGR_IND)) {
 		progress.fields |= MNCC_F_PROGRESS;
@@ -653,13 +678,17 @@ static int gsm48_cc_rx_call_proceeding(struct gsm_trans *trans,
 	struct tlv_parsed tp;
 	struct gsm_mncc call_proc;
 
-	LOGP(DCC, LOGL_INFO, "sending CALL PROCEEDING\n");
+	LOGP(DCC, LOGL_INFO, "received CALL PROCEEDING\n");
+
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
 
 	gsm48_stop_cc_timer(trans);
 
 	memset(&call_proc, 0, sizeof(struct gsm_mncc));
 	call_proc.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 #if 0
 	/* repeat */
 	if (TLVP_PRESENT(&tp, GSM48_IE_REPEAT_CIR))
@@ -711,12 +740,16 @@ static int gsm48_cc_rx_alerting(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received ALERTING\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	gsm48_stop_cc_timer(trans);
 	/* no T301 in MS call control */
 
 	memset(&alerting, 0, sizeof(struct gsm_mncc));
 	alerting.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 	/* facility */
 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
 		alerting.fields |= MNCC_F_FACILITY;
@@ -752,11 +785,15 @@ static int gsm48_cc_rx_connect(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received CONNECT\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	gsm48_stop_cc_timer(trans);
 
 	memset(&connect, 0, sizeof(struct gsm_mncc));
 	connect.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 	/* facility */
 	if (TLVP_PRESENT(&tp, GSM48_IE_FACILITY)) {
 		connect.fields |= MNCC_F_FACILITY;
@@ -822,10 +859,13 @@ static int gsm48_cc_rx_setup(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received SETUP\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	memset(&setup, 0, sizeof(struct gsm_mncc));
 	setup.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
-
 	/* bearer capability */
 	if (TLVP_PRESENT(&tp, GSM48_IE_BEARER_CAP)) {
 		setup.fields |= MNCC_F_BEARER_CAP;
@@ -1075,9 +1115,13 @@ static int gsm48_cc_rx_start_dtmf_ack(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received START DTMF ACKNOWLEDGE\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	memset(&dtmf, 0, sizeof(struct gsm_mncc));
 	dtmf.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 	/* keypad facility */
 	if (TLVP_PRESENT(&tp, GSM48_IE_KPD_FACILITY)) {
 		dtmf.fields |= MNCC_F_KEYPAD;
@@ -1138,9 +1182,13 @@ static int gsm48_cc_rx_stop_dtmf_ack(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received STOP DTMF ACKNOWLEDGE\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	memset(&dtmf, 0, sizeof(struct gsm_mncc));
 	dtmf.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 
 	return mncc_recvmsg(trans->ms, trans, MNCC_STOP_DTMF_RSP, &dtmf);
 }
@@ -1334,15 +1382,18 @@ static int gsm48_cc_rx_userinfo(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received USERINFO\n");
 
-	memset(&user, 0, sizeof(struct gsm_mncc));
-	user.callref = trans->callref;
 	if (payload_len < 1) {
-		LOGP(DCC, LOGL_NOTICE, "Short read of userinfo message "
-			"error.\n");
+		LOGP(DCC, LOGL_NOTICE, "Short read of USERINFO message\n");
 		return -EINVAL;
 	}
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
-		GSM48_IE_USER_USER, 0);
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
+		      GSM48_IE_USER_USER, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
+	memset(&user, 0, sizeof(struct gsm_mncc));
+	user.callref = trans->callref;
 	/* user-user */
 	gsm48_decode_useruser(&user.useruser,
 			TLVP_VAL(&tp, GSM48_IE_USER_USER)-1);
@@ -1416,17 +1467,20 @@ static int gsm48_cc_rx_modify_reject(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received MODIFY REJECT\n");
 
+	if (payload_len < 1) {
+		LOGP(DCC, LOGL_NOTICE, "Short read of MODIFY REJECT message\n");
+		return -EINVAL;
+	}
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
+		      GSM48_IE_BEARER_CAP, GSM48_IE_CAUSE) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	gsm48_stop_cc_timer(trans);
 
 	memset(&modify, 0, sizeof(struct gsm_mncc));
 	modify.callref = trans->callref;
-	if (payload_len < 1) {
-		LOGP(DCC, LOGL_NOTICE, "Short read of modify reject message "
-			"error.\n");
-		return -EINVAL;
-	}
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
-		GSM48_IE_BEARER_CAP, GSM48_IE_CAUSE);
 	/* bearer capability */
 	if (TLVP_PRESENT(&tp, GSM48_IE_BEARER_CAP)) {
 		modify.fields |= MNCC_F_BEARER_CAP;
@@ -1674,14 +1728,18 @@ static int gsm48_cc_rx_disconnect(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received DISCONNECT\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
+		      GSM48_IE_CAUSE, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	gsm48_stop_cc_timer(trans);
 
 	new_cc_state(trans, GSM_CSTATE_DISCONNECT_IND);
 
 	memset(&disc, 0, sizeof(struct gsm_mncc));
 	disc.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len,
-		GSM48_IE_CAUSE, 0);
 	/* cause */
 	if (TLVP_PRESENT(&tp, GSM48_IE_CAUSE)) {
 		disc.fields |= MNCC_F_CAUSE;
@@ -1723,11 +1781,15 @@ static int gsm48_cc_rx_release(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received RELEASE\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	gsm48_stop_cc_timer(trans);
 
 	memset(&rel, 0, sizeof(struct gsm_mncc));
 	rel.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 	/* cause */
 	if (TLVP_PRESENT(&tp, GSM48_IE_CAUSE)) {
 		rel.fields |= MNCC_F_CAUSE;
@@ -1792,11 +1854,15 @@ static int gsm48_cc_rx_release_compl(struct gsm_trans *trans, struct msgb *msg)
 
 	LOGP(DCC, LOGL_INFO, "received RELEASE COMPLETE\n");
 
+	if (tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0) < 0) {
+		LOGP(DCC, LOGL_ERROR, "%s(): tlv_parse() failed\n", __func__);
+		return -EINVAL;
+	}
+
 	gsm48_stop_cc_timer(trans);
 
 	memset(&rel, 0, sizeof(struct gsm_mncc));
 	rel.callref = trans->callref;
-	tlv_parse(&tp, &gsm48_att_tlvdef, gh->data, payload_len, 0, 0);
 	/* cause */
 	if (TLVP_PRESENT(&tp, GSM48_IE_CAUSE)) {
 		rel.fields |= MNCC_F_CAUSE;
@@ -1934,10 +2000,16 @@ int mncc_tx_to_cc(void *inst, int msg_type, void *arg)
 		return -EBUSY;
 	}
 
+	/* ASCI call does not allow other transactions */
+	if (trans_find_ongoing_gcc_bcc(ms)) {
+		LOGP(DCC, LOGL_NOTICE, "Phone is busy doing ASCI call\n");
+		return -EBUSY;
+	}
+
 	data->msg_type = msg_type;
 
 	/* Find callref */
-	trans = trans_find_by_callref(ms, data->callref);
+	trans = trans_find_by_callref(ms, GSM48_PDISC_CC, data->callref);
 
 	if (!trans) {
 		/* check for SETUP message */
@@ -1965,13 +2037,15 @@ int mncc_tx_to_cc(void *inst, int msg_type, void *arg)
 		}
 	}
 
+	gsm48_cc_trans_bcap_update(trans, data);
+
 	switch (msg_type) {
 	case GSM_TCHF_FRAME:
 	case GSM_TCHF_FRAME_EFR:
 	case GSM_TCHH_FRAME:
 	case GSM_TCH_FRAME_AMR:
 	case GSM_BAD_FRAME:
-		return gsm_send_voice_frame(ms, arg);
+		return tch_send_mncc_frame(ms, arg);
 	case MNCC_LCHAN_MODIFY:
 		return 0;
 	case MNCC_FRAME_RECV:
@@ -2096,15 +2170,21 @@ static struct datastate {
 static int gsm48_cc_data_ind(struct gsm_trans *trans, struct msgb *msg)
 {
 	struct osmocom_ms *ms = trans->ms;
-	struct gsm48_hdr *gh = msgb_l3(msg);
-	int msg_type = gh->msg_type & 0xbf;
-	uint8_t transaction_id = ((gh->proto_discr & 0xf0) ^ 0x80) >> 4;
-		/* flip */
+	const struct gsm48_hdr *gh = msgb_l3(msg);
 	int msg_supported = 0; /* determine, if message is supported at all */
+	uint8_t msg_type;
 	int i, rc;
 
-	/* set transaction ID, if not already */
-	trans->transaction_id = transaction_id;
+	if (msgb_l3len(msg) < sizeof(*gh)) {
+		LOGP(DCC, LOGL_INFO, "%s(): short read of msgb: %s\n",
+		     __func__, msgb_hexdump(msg));
+		return -EINVAL;
+	}
+
+	msg_type = gh->msg_type & 0xbf;
+
+	/* set transaction ID (flip), if not already */
+	trans->transaction_id = ((gh->proto_discr & 0xf0) ^ 0x80) >> 4;
 
 	/* pull the MMCC header */
 	msgb_pull(msg, sizeof(struct gsm48_mmxx_hdr));
@@ -2147,7 +2227,7 @@ int gsm48_rcv_cc(struct osmocom_ms *ms, struct msgb *msg)
 	struct gsm_trans *trans;
 	int rc = 0;
 
-	trans = trans_find_by_callref(ms, mmh->ref);
+	trans = trans_find_by_callref(ms, GSM48_PDISC_CC, mmh->ref);
 	if (!trans) {
 		trans = trans_alloc(ms, GSM48_PDISC_CC, mmh->transaction_id,
 					mmh->ref);

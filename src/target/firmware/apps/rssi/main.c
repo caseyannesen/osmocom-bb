@@ -78,9 +78,9 @@ char *sync_msg = "";
 static struct band {
 	int min, max, prev, next, freq_ul, freq_dl;
 } bands[] = {
-        { 128, 251, 124, 512, 8242, 8692 }, /* GSM 850 */
-        { 955, 124, 885, 128, 8762, 9212 }, /* P,E,R GSM */
-        { 512, 885, 251, 955, 17102, 18052 }, /* DCS 1800 */
+	{ 128, 251, 124, 512, 8242, 8692 }, /* GSM 850 */
+	{ 940, 124, 885, 128, 8732, 9182 }, /* P,E,(E)R GSM */
+	{ 512, 885, 251, 940, 17102, 18052 }, /* DCS 1800 */
 	{ 0, 0, 0, 0, 0, 0},
 };
 
@@ -1209,6 +1209,7 @@ static void enter_rach(void)
 	rach_req->ra = rach_ra;
 	rach_req->offset = 0;
 	rach_req->combined = (ccch_conf == 1);
+	rach_req->uic = 0xff; /* disable, use BSIC instead */
 
 	l1a_l23_rx(SC_DLCI_L1A_L23, msg1);
 	l1a_l23_rx(SC_DLCI_L1A_L23, msg2);

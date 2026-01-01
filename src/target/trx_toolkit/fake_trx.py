@@ -27,6 +27,7 @@ import random
 import select
 import sys
 import re
+import os
 
 from app_common import ApplicationBase
 from burst_fwd import BurstForwarder
@@ -397,7 +398,9 @@ class Application(ApplicationBase):
 		self.trx_list = TRXList()
 
 		# Init shared clock generator
-		self.clck_gen = CLCKGen([])
+		self.clck_gen = CLCKGen([], sched_rr_prio = None if self.argv.sched_rr_prio is None else self.argv.sched_rr_prio + 1)
+		# This method will be called on each TDMA frame
+		self.clck_gen.clck_handler = self.clck_handler
 
 		# Power measurement emulation
 		# Noise: -120 .. -105
@@ -448,6 +451,14 @@ class Application(ApplicationBase):
 		trx_parent.child_trx_list.add_trx(trx_child)
 
 	def run(self):
+		if self.argv.sched_rr_prio is not None:
+			sched_param = os.sched_param(self.argv.sched_rr_prio)
+			try:
+				log.info("Setting real time process scheduler to SCHED_RR, priority %u" % (self.argv.sched_rr_prio))
+				os.sched_setscheduler(0, os.SCHED_RR, sched_param)
+			except OSError:
+				log.error("Failed to set real time process scheduler to SCHED_RR, priority %u" % (self.argv.sched_rr_prio))
+
 		# Compose list of to be monitored sockets
 		sock_list = []
 		for trx in self.trx_list.trx_list:
@@ -463,13 +474,17 @@ class Application(ApplicationBase):
 			for trx in self.trx_list.trx_list:
 				# DATA interface
 				if trx.data_if.sock in r_event:
-					msg = trx.recv_data_msg()
-					if msg is not None:
-						self.burst_fwd.forward_msg(trx, msg)
+					trx.recv_data_msg()
 
 				# CTRL interface
 				if trx.ctrl_if.sock in r_event:
 					trx.ctrl_if.handle_rx()
+
+	# This method will be called by the clock thread
+	def clck_handler(self, fn):
+		# We assume that this list is immutable at run-time
+		for trx in self.trx_list.trx_list:
+			trx.clck_tick(self.burst_fwd, fn)
 
 	def shutdown(self):
 		log.info("Shutting down...")
@@ -524,6 +539,9 @@ class Application(ApplicationBase):
 		trx_group.add_argument("-p", "--bb-base-port",
 			dest = "bb_base_port", type = int, default = 6700,
 			help = "Set BB base port number (default %(default)s)")
+		trx_group.add_argument("-s", "--sched-rr-prio",
+			dest = "sched_rr_prio", type = int, default = None,
+			help = "Set Scheduler RR Priority (default None)")
 
 		mtrx_group = parser.add_argument_group("Additional transceivers")
 		mtrx_group.add_argument("--trx",

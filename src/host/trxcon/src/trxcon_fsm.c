@@ -369,6 +369,9 @@ static void handle_dch_est_req(struct osmo_fsm_inst *fi,
 		return;
 	}
 
+	/* Store TSC for subsequent PDCH timeslot activation(s) */
+	trxcon->l1p.tsc = req->tsc;
+
 	if (config == GSM_PCHAN_PDCH)
 		osmo_fsm_inst_state_chg(fi, TRXCON_ST_PACKET_DATA, 0, 0);
 	else
@@ -517,6 +520,35 @@ static void trxcon_st_dedicated_action(struct osmo_fsm_inst *fi,
 	}
 }
 
+static void handle_tbf_cfg_req(struct trxcon_inst *trxcon, uint8_t tn, bool active)
+{
+	struct l1sched_state *sched = trxcon->sched;
+
+	if (active) {
+		struct l1sched_lchan_state *lchan;
+		struct l1sched_ts *ts;
+
+		if (sched->ts[tn] != NULL) /* already enabled */
+			return;
+		if (l1sched_configure_ts(sched, tn, GSM_PCHAN_PDCH) != 0)
+			return;
+		OSMO_ASSERT(sched->ts[tn] != NULL);
+		ts = sched->ts[tn];
+
+		l1sched_activate_lchan(ts, L1SCHED_PDTCH);
+		l1sched_activate_lchan(ts, L1SCHED_PTCCH);
+		llist_for_each_entry(lchan, &ts->lchans, list)
+			lchan->tsc = trxcon->l1p.tsc;
+	} else {
+		l1sched_del_ts(sched, tn);
+	}
+}
+
+static void trxcon_l1gprs_state_changed_cb(struct l1gprs_pdch *pdch, bool active)
+{
+	handle_tbf_cfg_req(pdch->gprs->priv, pdch->tn, active);
+}
+
 static void trxcon_st_packet_data_onenter(struct osmo_fsm_inst *fi,
 					  uint32_t prev_state)
 {
@@ -524,6 +556,7 @@ static void trxcon_st_packet_data_onenter(struct osmo_fsm_inst *fi,
 
 	OSMO_ASSERT(trxcon->gprs == NULL);
 	trxcon->gprs = l1gprs_state_alloc(trxcon, trxcon->log_prefix, trxcon);
+	l1gprs_state_set_pdch_changed_cb(trxcon->gprs, trxcon_l1gprs_state_changed_cb);
 	OSMO_ASSERT(trxcon->gprs != NULL);
 }
 
@@ -577,11 +610,24 @@ static void trxcon_st_packet_data_action(struct osmo_fsm_inst *fi,
 		l1sched_prim_from_user(trxcon->sched, msg);
 		break;
 	}
+	case TRXCON_EV_TX_DATA_CNF:
+	{
+		const struct trxcon_param_tx_data_cnf *cnf = data;
+		struct msgb *msg;
+
+		msg = l1gprs_handle_ul_block_cnf(trxcon->gprs,
+						 cnf->frame_nr, cnf->chan_nr & 0x07,
+						 cnf->data, cnf->data_len);
+		if (msg != NULL)
+			trxcon_l1ctl_send(trxcon, msg);
+		break;
+	}
 	case TRXCON_EV_RX_DATA_IND:
 	{
 		const struct trxcon_param_rx_data_ind *ind = data;
 		struct l1gprs_prim_dl_block_ind block_ind;
 		struct msgb *msg;
+		uint8_t usf = 0xff;
 
 		block_ind = (struct l1gprs_prim_dl_block_ind) {
 			.hdr = {
@@ -602,7 +648,14 @@ static void trxcon_st_packet_data_action(struct osmo_fsm_inst *fi,
 		else
 			block_ind.meas.ber10k = 10000 * ind->n_errors / ind->n_bits_total;
 
-		msg = l1gprs_handle_dl_block_ind(trxcon->gprs, &block_ind);
+		msg = l1gprs_handle_dl_block_ind(trxcon->gprs, &block_ind, &usf);
+		if (msg != NULL)
+			trxcon_l1ctl_send(trxcon, msg);
+		/* Every fn % 13 == 12 we have either a PTCCH or an IDLE slot, thus
+		 * every fn % 13 ==  8 we add 5 frames, or 4 frames othrwise.  The
+		 * resulting value is first fn of the next block. */
+		const uint32_t rts_fn = GSM_TDMA_FN_SUM(ind->frame_nr, (ind->frame_nr % 13 == 8) ? 5 : 4);
+		msg = l1gprs_handle_rts_ind(trxcon->gprs, rts_fn, ind->chan_nr & 0x07, usf);
 		if (msg != NULL)
 			trxcon_l1ctl_send(trxcon, msg);
 		break;
@@ -613,8 +666,6 @@ static void trxcon_st_packet_data_action(struct osmo_fsm_inst *fi,
 	case TRXCON_EV_DCH_REL_REQ:
 		l1sched_reset(trxcon->sched, false);
 		/* TODO: switch to (not implemented) TRXCON_ST_DCH_TUNING? */
-		break;
-	case TRXCON_EV_TX_DATA_CNF:
 		break;
 	default:
 		OSMO_ASSERT(0);

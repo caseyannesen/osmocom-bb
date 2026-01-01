@@ -195,9 +195,9 @@ struct l1sched_meas_set {
 	int8_t rssi;
 };
 
-/* Simple ring buffer (up to 8 unique measurements) */
+/* Simple ring buffer (up to 24 unique measurements) */
 struct l1sched_lchan_meas_hist {
-	struct l1sched_meas_set buf[8];
+	struct l1sched_meas_set buf[24];
 	struct l1sched_meas_set *head;
 };
 
@@ -213,9 +213,9 @@ struct l1sched_lchan_state {
 	/*! Burst type: GMSK or 8PSK */
 	enum l1sched_burst_type burst_type;
 	/*! Mask of received bursts */
-	uint8_t rx_burst_mask;
+	uint32_t rx_burst_mask;
 	/*! Mask of transmitted bursts */
-	uint8_t tx_burst_mask;
+	uint32_t tx_burst_mask;
 	/*! Burst buffer for RX */
 	sbit_t *rx_bursts;
 	/*! Burst buffer for TX */
@@ -329,8 +329,8 @@ struct l1sched_state {
 };
 
 extern const struct l1sched_lchan_desc l1sched_lchan_desc[_L1SCHED_CHAN_MAX];
-const struct l1sched_tdma_multiframe *l1sched_mframe_layout(
-	enum gsm_phys_chan_config config, int tn);
+const struct l1sched_tdma_multiframe *
+l1sched_mframe_layout(enum gsm_phys_chan_config config, uint8_t tn);
 
 /* Scheduler management functions */
 struct l1sched_state *l1sched_alloc(void *ctx, const struct l1sched_cfg *cfg, void *priv);
@@ -388,21 +388,7 @@ int l1sched_handle_burst_req(struct l1sched_state *sched,
 /* Shared declarations for lchan handlers */
 extern const uint8_t l1sched_nb_training_bits[8][26];
 
-const char *l1sched_burst_mask2str(const uint8_t *mask, int bits);
-
-/* Interleaved TCH/H block TDMA frame mapping */
-bool l1sched_tchh_block_map_fn(enum l1sched_lchan_type chan,
-	uint32_t fn, bool ul, bool facch, bool start);
-
-#define l1sched_tchh_traffic_start(chan, fn, ul) \
-	l1sched_tchh_block_map_fn(chan, fn, ul, 0, 1)
-#define l1sched_tchh_traffic_end(chan, fn, ul) \
-	l1sched_tchh_block_map_fn(chan, fn, ul, 0, 0)
-
-#define l1sched_tchh_facch_start(chan, fn, ul) \
-	l1sched_tchh_block_map_fn(chan, fn, ul, 1, 1)
-#define l1sched_tchh_facch_end(chan, fn, ul) \
-	l1sched_tchh_block_map_fn(chan, fn, ul, 1, 0)
+const char *l1sched_burst_mask2str(const uint32_t *mask, int bits);
 
 /* Measurement history */
 void l1sched_lchan_meas_push(struct l1sched_lchan_state *lchan,

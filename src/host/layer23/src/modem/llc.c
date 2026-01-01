@@ -74,6 +74,7 @@ static int modem_llc_handle_ll_sndcp(struct osmo_gprs_llc_prim *llc_prim)
 	case OSMO_GPRS_LLC_LL_DATA:
 	case OSMO_GPRS_LLC_LL_UNITDATA:
 	case OSMO_GPRS_LLC_LL_STATUS:
+	case OSMO_GPRS_LLC_LL_ASSIGN:
 		/* Forward it to upper layers, pass owneserip over to SNDCP: */
 		osmo_gprs_sndcp_prim_lower_up(llc_prim);
 		rc = 1; /* Tell LLC that we take ownership of the prim. */
@@ -141,7 +142,12 @@ int modem_llc_prim_down_cb(struct osmo_gprs_llc_prim *llc_prim, void *user_data)
 
 	switch (llc_prim->oph.sap) {
 	case OSMO_GPRS_LLC_SAP_GRR:
-		LOGP(DLLC, LOGL_DEBUG, "%s(): Rx %s ll=[%s]\n",  __func__, pdu_name,
+		LOGP(DLLC, LOGL_DEBUG, "%s(): Rx %s TLLI=0x%08x SAPI=%s RadioPrio=%u ll=[%s]\n",
+		     __func__, pdu_name, llc_prim->grr.tlli,
+		     /* data_req.sapi in same union pos: */
+		     osmo_gprs_llc_sapi_name(llc_prim->grr.unitdata_req.sapi),
+		     /* data_req.radio_prio in same union pos: */
+		     llc_prim->grr.unitdata_req.radio_prio,
 		     osmo_hexdump(llc_prim->grr.ll_pdu, llc_prim->grr.ll_pdu_len));
 		/* Forward it to lower layers, pass ownership over to RLCMAC: */
 		/* Optimization: LLC-GRR-UNITDATA-IND is 1-to-1 ABI compatible with

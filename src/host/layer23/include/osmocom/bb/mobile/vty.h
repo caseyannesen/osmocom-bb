@@ -10,7 +10,10 @@
 
 enum ms_vty_node {
 	SUPPORT_NODE = _LAST_L23VTY_NODE + 1,
-	AUDIO_NODE,
+	TCH_VOICE_NODE,
+	TCH_DATA_NODE,
+	VGCS_NODE,
+	VBS_NODE,
 };
 
 int ms_vty_init(void);

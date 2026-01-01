@@ -62,34 +62,6 @@
 
 struct modem_app app_data;
 
-static bool modem_can_gprs_attach(const struct osmocom_ms *ms)
-{
-	const struct gsm_subscriber *subscr = &ms->subscr;
-	const struct gsm322_cellsel *cs = &ms->cellsel;
-	const struct gsm48_sysinfo *si = &cs->sel_si;
-
-	if (!subscr->sim_valid)
-		goto ret_false;
-
-	if (!si->si1 || !si->si3 || !si->si4 || !si->si13)
-		goto ret_false;
-
-	if (!si->gprs.supported)
-		goto ret_false;
-
-	return true;
-
-ret_false:
-	LOGP(DRLCMAC, LOGL_INFO, "Delaying GPRS attach, waiting for:%s%s%s%s%s%s\n",
-	     subscr->sim_valid ? "" : " imsi",
-	     si->si1 ? "" : " si1",
-	     si->si3 ? "" : " si3",
-	     si->si4 ? "" : " si4",
-	     si->si13 ? "" : " si13",
-	     si->gprs.supported ? "" : " GprsIndicator");
-	return false;
-}
-
 int modem_gprs_attach_if_needed(struct osmocom_ms *ms)
 {
 	int rc;
@@ -97,7 +69,10 @@ int modem_gprs_attach_if_needed(struct osmocom_ms *ms)
 	if (app_data.modem_state != MODEM_ST_IDLE)
 		return 0;
 
-	if (!modem_can_gprs_attach(ms))
+	if (ms->grr_fi->state == GRR_ST_PACKET_NOT_READY)
+		return 0;
+
+	if (!ms->subscr.sim_valid)
 		return 0;
 
 	app_data.modem_state = MODEM_ST_ATTACHING;
@@ -146,6 +121,28 @@ static int modem_tun_data_ind_cb(struct osmo_tundev *tun, struct msgb *msg)
 	LOGPAPN(LOGL_DEBUG, apn, "system wants to transmit IPv%c pkt to %s (%zu bytes)\n",
 		iph->version == 4 ? '4' : '6', osmo_sockaddr_ntop(&dst.u.sa, addrstr), pkt_len);
 
+	switch (apn->pdp.pdp_addr_ietf_type) {
+	case OSMO_GPRS_SM_PDP_ADDR_IETF_IPV4:
+		if (iph->version != 4) {
+			LOGPAPN(LOGL_NOTICE, apn,
+				"system wants to transmit IPv%u pkt to %s (%zu bytes) on IPv4-only PDP Ctx, discarding!\n",
+				iph->version, osmo_sockaddr_ntop(&dst.u.sa, addrstr), pkt_len);
+			goto free_ret;
+		}
+		break;
+	case OSMO_GPRS_SM_PDP_ADDR_IETF_IPV6:
+		if (iph->version != 6) {
+			LOGPAPN(LOGL_NOTICE, apn,
+				"system wants to transmit IPv%u pkt to %s (%zu bytes) on IPv6-only PDP Ctx, discarding!\n",
+				iph->version, osmo_sockaddr_ntop(&dst.u.sa, addrstr), pkt_len);
+			goto free_ret;
+		}
+		break;
+	default: /* OSMO_GPRS_SM_PDP_ADDR_IETF_IPV4V6 */
+		/* Allow any */
+		break;
+	}
+
 	rc = modem_sndcp_sn_unitdata_req(apn, msgb_data(msg), pkt_len);
 
 free_ret:
@@ -190,17 +187,40 @@ static int modem_l23_subscr_signal_cb(unsigned int subsys, unsigned int signal,
 	return 0;
 }
 
+int modem_sync_to_cell(struct osmocom_ms *ms)
+{
+	struct gsm322_cellsel *cs = &ms->cellsel;
+
+	if (cs->sync_pending) {
+		LOGP(DCS, LOGL_INFO, "Sync to ARFCN=%s, but there is a sync "
+			"already pending\n", gsm_print_arfcn(cs->arfcn));
+		return 0;
+	}
+
+	cs->sync_pending = true;
+	l1ctl_tx_reset_req(ms, L1CTL_RES_T_FULL);
+	return l1ctl_tx_fbsb_req(ms, cs->arfcn,
+			L1CTL_FBSB_F_FB01SB, 100, 0,
+			cs->ccch_mode, dbm2rxlev(-85));
+}
+
 static int global_signal_cb(unsigned int subsys, unsigned int signal,
 			    void *handler_data, void *signal_data)
 {
 	struct osmocom_ms *ms;
+	struct gsm322_cellsel *cs;
+	struct osmobb_fbsb_res *fr;
 
 	if (subsys != SS_L1CTL)
 		return 0;
 
 	switch (signal) {
 	case S_L1CTL_RESET:
+		LOGP(DCS, LOGL_NOTICE, "S_L1CTL_RESET\n");
 		ms = signal_data;
+		ms->cellsel.arfcn = ms->test_arfcn;
+		if (ms->started)
+			break;
 		layer3_app_reset();
 		app_data.ms = ms;
 
@@ -219,6 +239,22 @@ static int global_signal_cb(unsigned int subsys, unsigned int signal,
 		return l1ctl_tx_fbsb_req(ms, ms->test_arfcn,
 					 L1CTL_FBSB_F_FB01SB, 100, 0,
 					 CCCH_MODE_NONE, dbm2rxlev(-85));
+	case S_L1CTL_FBSB_RESP:
+		LOGP(DCS, LOGL_NOTICE, "S_L1CTL_FBSB_RESP\n");
+		fr = signal_data;
+		ms = fr->ms;
+		cs = &ms->cellsel;
+		cs->sync_pending = false;
+		break;
+	case S_L1CTL_FBSB_ERR:
+		LOGP(DCS, LOGL_NOTICE, "S_L1CTL_FBSB_ERR\n");
+		fr = signal_data;
+		ms = fr->ms;
+		cs = &ms->cellsel;
+		cs->sync_pending = false;
+		/* Retry: */
+		modem_sync_to_cell(ms);
+		break;
 	}
 
 	return 0;
@@ -284,6 +320,12 @@ int l23_app_init(void)
 		LOGP(DSM, LOGL_FATAL, "Failed initializing SM layer\n");
 		return rc;
 	}
+
+	/* TODO: move to a separate function */
+	app_data.ms->grr_fi = osmo_fsm_inst_alloc(&grr_fsm_def, NULL,
+						  app_data.ms, LOGL_DEBUG,
+						  app_data.ms->name);
+	OSMO_ASSERT(app_data.ms->grr_fi != NULL);
 
 	osmo_signal_register_handler(SS_L1CTL, &global_signal_cb, NULL);
 	osmo_signal_register_handler(SS_L23_SUBSCR, &modem_l23_subscr_signal_cb, NULL);

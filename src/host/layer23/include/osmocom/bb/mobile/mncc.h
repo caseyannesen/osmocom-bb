@@ -19,29 +19,9 @@
  *
  */
 
-#ifndef _MNCC_H
-#define _MNCC_H
+#pragma once
 
-#include <osmocom/core/linuxlist.h>
-#include <osmocom/core/timer.h>
 #include <osmocom/gsm/mncc.h>
-
-struct gsm_call {
-	struct llist_head	entry;
-
-	struct osmocom_ms	*ms;
-
-	uint32_t		callref;
-
-	bool			init; /* call initiated, no response yet */
-	bool			hold; /* call on hold */
-	bool			ring; /* call ringing/knocking */
-
-	struct osmo_timer_list	dtmf_timer;
-	uint8_t			dtmf_state;
-	uint8_t			dtmf_index;
-	char			dtmf[32]; /* dtmf sequence */
-};
 
 #define DTMF_ST_IDLE		0	/* no DTMF active */
 #define DTMF_ST_START		1	/* DTMF started, waiting for resp. */
@@ -128,6 +108,8 @@ struct gsm_call {
 #define MNCC_F_KEYPAD		0x1000
 #define MNCC_F_SIGNAL		0x2000
 
+struct osmocom_ms;
+
 struct gsm_mncc {
 	/* context based information */
 	uint32_t	msg_type;
@@ -174,6 +156,3 @@ struct gsm_data_frame {
 const char *get_mncc_name(int value);
 int mncc_recv(struct osmocom_ms *ms, int msg_type, void *arg);
 void mncc_set_cause(struct gsm_mncc *data, int loc, int val);
-
-#endif
-

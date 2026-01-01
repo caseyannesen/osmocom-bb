@@ -17,6 +17,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
+import logging as log
 import socket
 
 class UDPLink:
@@ -40,13 +41,15 @@ class UDPLink:
 			% (bind_addr, bind_port, self.remote_addr, self.remote_port)
 
 	def send(self, data):
-		if type(data) not in [bytearray, bytes]:
-			data = data.encode()
-
-		self.sock.sendto(data, (self.remote_addr, self.remote_port))
+		self.sendto(data, (self.remote_addr, self.remote_port))
 
 	def sendto(self, data, remote):
 		if type(data) not in [bytearray, bytes]:
 			data = data.encode()
-
-		self.sock.sendto(data, remote)
+		try:
+			self.sock.sendto(data, remote)
+		except BlockingIOError:
+			# When the message does not fit into the send buffer of the socket, send()
+			# normally blocks, unless the socket has been placed in nonblocking I/O mode.
+			# In nonblocking mode it would fail with the BlockingIOError in this case.
+			log.error('(%s) BlockingIOError: dropping Tx data', self.desc_link())

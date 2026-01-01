@@ -64,6 +64,18 @@ static const struct log_info_cat default_categories[] = {
 		.color = "\033[1;33m",
 		.enabled = 1, .loglevel = LOGL_NOTICE,
 	},
+	[DGCC] = {
+		.name = "DGCC",
+		.description = "Group Call Control",
+		.color = "\033[1;33m",
+		.enabled = 1, .loglevel = LOGL_NOTICE,
+	},
+	[DBCC] = {
+		.name = "DBCC",
+		.description = "Broadcast Call Control",
+		.color = "\033[1;33m",
+		.enabled = 1, .loglevel = LOGL_NOTICE,
+	},
 	[DSS] = {
 		.name = "DSS",
 		.description = "Supplenmentary Services",
@@ -144,6 +156,12 @@ static const struct log_info_cat default_categories[] = {
 	[DGAPK] = {
 		.name = "DGAPK",
 		.description = "GAPK audio",
+		.color = "\033[0;36m",
+		.enabled = 1, .loglevel = LOGL_DEBUG,
+	},
+	[DCSD] = {
+		.name = "DCSD",
+		.description = "Circuit Switched Data",
 		.color = "\033[0;36m",
 		.enabled = 1, .loglevel = LOGL_DEBUG,
 	},

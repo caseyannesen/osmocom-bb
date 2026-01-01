@@ -1,7 +1,6 @@
 /*
- * (C) 2010 by Andreas Eversberg <jolly@eversberg.eu>
  * (C) 2017-2018 by Vadim Yanitskiy <axilirator@gmail.com>
- * (C) 2022 by sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+ * (C) 2022-2024 by sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
  *
  * All Rights Reserved
  *
@@ -17,12 +16,13 @@
  *
  */
 
-#include <string.h>
+#include <stdint.h>
 #include <errno.h>
 
+#include <osmocom/core/utils.h>
 #include <osmocom/core/msgb.h>
-#include <osmocom/codec/codec.h>
 
+#include <osmocom/gsm/protocol/gsm_04_08.h>
 #include <osmocom/gsm/protocol/gsm_08_58.h>
 
 #include <osmocom/bb/common/logging.h>
@@ -31,10 +31,13 @@
 #include <osmocom/bb/mobile/gapk_io.h>
 #include <osmocom/bb/mobile/mncc.h>
 #include <osmocom/bb/mobile/mncc_sock.h>
-#include <osmocom/bb/mobile/voice.h>
+#include <osmocom/bb/mobile/transaction.h>
+#include <osmocom/bb/mobile/tch.h>
+
+#include <l1ctl_proto.h>
 
 /* Forward a Downlink voice frame to the external MNCC handler */
-static int gsm_forward_mncc(struct osmocom_ms *ms, struct msgb *msg)
+static int tch_forward_mncc(struct osmocom_ms *ms, struct msgb *msg)
 {
 	struct gsm_data_frame *mncc;
 
@@ -73,77 +76,80 @@ exit_free:
 	return 0;
 }
 
-/* Receive a Downlink voice frame from the lower layers */
-static int gsm_recv_voice(struct osmocom_ms *ms, struct msgb *msg)
+int tch_voice_recv(struct osmocom_ms *ms, struct msgb *msg)
 {
-	switch (ms->settings.audio.io_handler) {
-	case AUDIO_IOH_LOOPBACK:
+	struct tch_voice_state *state = &ms->tch_state->voice;
+
+	switch (state->handler) {
+	case TCH_VOICE_IOH_LOOPBACK:
+		/* Remove the DL info header */
+		msgb_pull_to_l2(msg);
 		/* Send voice frame back */
-		return gsm_send_voice_msg(ms, msg);
-	case AUDIO_IOH_MNCC_SOCK:
-		return gsm_forward_mncc(ms, msg);
-	case AUDIO_IOH_GAPK:
+		return tch_send_msg(ms, msg);
+	case TCH_VOICE_IOH_MNCC_SOCK:
+		return tch_forward_mncc(ms, msg);
+	case TCH_VOICE_IOH_GAPK:
 #ifdef WITH_GAPK_IO
-		/* Enqueue a frame to the DL TCH buffer */
-		if (ms->gapk_io != NULL)
-			gapk_io_enqueue_dl(ms->gapk_io, msg);
-		else
+		if (state->gapk_io != NULL) {
+			gapk_io_enqueue_dl(state->gapk_io, msg);
+			gapk_io_dequeue_ul(ms, state->gapk_io);
+		} else {
 			msgb_free(msg);
+		}
 		break;
 #endif
-	case AUDIO_IOH_L1PHY:
-	case AUDIO_IOH_NONE:
+	case TCH_VOICE_IOH_L1PHY:
+	case TCH_VOICE_IOH_NONE:
 		/* Drop voice frame */
 		msgb_free(msg);
+		break;
 	}
 
 	return 0;
 }
 
-/* Send an Uplink voice frame to the lower layers */
-int gsm_send_voice_msg(struct osmocom_ms *ms, struct msgb *msg)
+int tch_voice_state_init(struct gsm_trans *trans, struct tch_voice_state *state)
 {
-	/* Forward to RR */
-	return gsm48_rr_tx_voice(ms, msg);
+	struct osmocom_ms *ms = trans->ms;
+	struct gsm48_rrlayer *rr = &ms->rrlayer;
+	const struct gsm48_rr_cd *cd = &rr->cd_now;
+
+	switch (state->handler) {
+	case TCH_VOICE_IOH_L1PHY:
+		rr->audio_mode = AUDIO_RX_SPEAKER | AUDIO_TX_MICROPHONE;
+		break;
+	case TCH_VOICE_IOH_MNCC_SOCK:
+	case TCH_VOICE_IOH_LOOPBACK:
+		rr->audio_mode = AUDIO_RX_TRAFFIC_IND | AUDIO_TX_TRAFFIC_REQ;
+		break;
+	case TCH_VOICE_IOH_GAPK:
+#ifdef WITH_GAPK_IO
+		if ((cd->chan_nr & RSL_CHAN_NR_MASK) == RSL_CHAN_Bm_ACCHs)
+			state->gapk_io = gapk_io_state_alloc_mode_rate(ms, cd->mode, true);
+		else /* RSL_CHAN_Lm_ACCHs */
+			state->gapk_io = gapk_io_state_alloc_mode_rate(ms, cd->mode, false);
+		if (state->gapk_io == NULL)
+			return -1;
+		rr->audio_mode = AUDIO_RX_TRAFFIC_IND | AUDIO_TX_TRAFFIC_REQ;
+		break;
+#endif
+	case TCH_VOICE_IOH_NONE:
+		rr->audio_mode = 0x00;
+		break;
+	}
+
+	return 0;
 }
 
-/* gsm_send_voice_msg() wrapper accepting an MNCC structure */
-int gsm_send_voice_frame(struct osmocom_ms *ms, const struct gsm_data_frame *frame)
+void tch_voice_state_free(struct tch_voice_state *state)
 {
-	struct msgb *nmsg;
-	int len;
-
-	switch (frame->msg_type) {
-	case GSM_TCHF_FRAME:
-		len = GSM_FR_BYTES;
+	switch (state->handler) {
+#ifdef WITH_GAPK_IO
+	case TCH_VOICE_IOH_GAPK:
+		gapk_io_state_free(state->gapk_io);
 		break;
-	case GSM_TCHF_FRAME_EFR:
-		len = GSM_EFR_BYTES;
-		break;
-	case GSM_TCHH_FRAME:
-		len = GSM_HR_BYTES;
-		break;
-	/* TODO: case GSM_TCH_FRAME_AMR (variable length) */
-	/* TODO: case GSM_BAD_FRAME (empty?) */
+#endif
 	default:
-		LOGP(DL1C, LOGL_ERROR, "%s(): msg_type=0x%02x: not implemented\n",
-		     __func__, frame->msg_type);
-		return -EINVAL;
+		break;
 	}
-
-	nmsg = msgb_alloc_headroom(len + 64, 64, "TCH/F");
-	if (!nmsg)
-		return -ENOMEM;
-	nmsg->l2h = msgb_put(nmsg, len);
-	memcpy(nmsg->l2h, frame->data, len);
-
-	return gsm_send_voice_msg(ms, nmsg);
-}
-
-/* Initialize voice router */
-int gsm_voice_init(struct osmocom_ms *ms)
-{
-	ms->l1_entity.l1_traffic_ind = gsm_recv_voice;
-
-	return 0;
 }
